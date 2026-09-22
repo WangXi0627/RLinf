@@ -197,7 +197,9 @@ else
 fi
 
 echo "Using Python at $(which python)"
-LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
+# LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
+LOG_ROOT="${LOG_ROOT:-${REPO_PATH}/logs}"
+LOG_DIR="${LOG_ROOT}/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
 
 MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
 

@@ -15,6 +15,7 @@
 import copy
 import glob
 import importlib
+import json
 import os
 import re
 import sys
@@ -76,6 +77,34 @@ def _read_bddl_language_and_goal(bddl_path: str):
     return language, goal
 
 
+def _resolve_plus_bddl_paths(
+    bddl_root: str, problem_folder: str, task_name: str
+) -> tuple[str, str, bool]:
+    """Resolve a LIBERO-Plus logical task to runtime and readable BDDL paths.
+
+    Some LIBERO-Plus variants intentionally use a virtual file name containing
+    ``_view_`` and ``_initstate_`` (and optionally ``_noise_``). ControlEnv
+    parses that suffix at runtime, then opens the physical base BDDL whose name
+    is the prefix before ``_view_``.
+    """
+    name = task_name[:-5] if task_name.endswith(".bddl") else task_name
+    runtime_path = os.path.abspath(
+        os.path.join(bddl_root, problem_folder, f"{name}.bddl")
+    )
+    if os.path.isfile(runtime_path):
+        return runtime_path, runtime_path, False
+
+    if "_view_" in name and "_initstate_" in name:
+        source_name = name.split("_view_", 1)[0]
+        source_path = os.path.abspath(
+            os.path.join(bddl_root, problem_folder, f"{source_name}.bddl")
+        )
+        if os.path.isfile(source_path):
+            return runtime_path, source_path, True
+
+    return runtime_path, runtime_path, False
+
+
 libero_type = get_libero_type()
 
 if libero_type in ["pro", "plus"]:
@@ -133,6 +162,21 @@ class LiberoEnv(gym.Env):
         self.total_num_processes = total_num_processes
         self.worker_info = worker_info
 
+        # Optional exact LIBERO-Plus category evaluation.  When configured, the
+        # official task-classification manifest takes precedence over the
+        # legacy suffix-based task selection below.
+        self.plus_category = cfg.get(
+            "plus_category", os.environ.get("LIBERO_CATEGORY", None)
+        )
+        self.plus_classification_path = cfg.get(
+            "plus_classification_path",
+            os.environ.get("LIBERO_CLASSIFICATION_PATH", None),
+        )
+        self.plus_strict_manifest = bool(cfg.get("plus_strict_manifest", True))
+        self.plus_expected_num_tasks = cfg.get("plus_expected_num_tasks", None)
+        self._plus_manifest_by_task = None
+        self._plus_manifest_entries = None
+
         if seed_offset == 0:
             self._log_evaluation_mode()
         self.seed = self.cfg.seed + seed_offset
@@ -155,6 +199,18 @@ class LiberoEnv(gym.Env):
         self.start_idx = 0
 
         self.task_suite: Benchmark = get_benchmark_overridden(cfg.task_suite_name)()
+
+        if get_libero_type() == "plus" and (
+            self.plus_category is not None
+            or self.plus_classification_path is not None
+        ):
+            if not self.plus_category or not self.plus_classification_path:
+                raise ValueError(
+                    "Exact LIBERO-Plus category evaluation requires both "
+                    "cfg.plus_category and cfg.plus_classification_path "
+                    "(or LIBERO_CATEGORY and LIBERO_CLASSIFICATION_PATH)."
+                )
+            self._load_plus_category_manifest()
 
         self._compute_total_num_group_envs()
         self.reset_state_ids_all = self.get_reset_state_ids_all()
@@ -187,10 +243,229 @@ class LiberoEnv(gym.Env):
             perturbation = os.environ.get("LIBERO_PERTURBATION", "all")
             logger.info(f"Evaluation Mode: LIBERO-PRO | Perturbation: {perturbation}")
         elif libero_type == "plus":
-            suffix = os.environ.get("LIBERO_SUFFIX", "all")
-            logger.info(f"Evaluation Mode: LIBERO-PLUS | Suffix: {suffix}")
+            if self.plus_category and self.plus_classification_path:
+                logger.info(
+                    "Evaluation Mode: LIBERO-PLUS | Category manifest: %s | "
+                    "Suite: %s",
+                    self.plus_category,
+                    self.cfg.task_suite_name,
+                )
+            else:
+                suffix = os.environ.get("LIBERO_SUFFIX", "all")
+                logger.info(f"Evaluation Mode: LIBERO-PLUS | Suffix: {suffix}")
         else:
             logger.info("Evaluation Mode: Standard LIBERO")
+
+    @property
+    def _uses_plus_category_manifest(self) -> bool:
+        return self._plus_manifest_by_task is not None
+
+    def _load_plus_category_manifest(self) -> None:
+        """Load one official LIBERO-Plus category and map it to suite tasks.
+
+        The official JSON has the form ``{suite_name: [task records...]}``.
+        Each selected BDDL becomes one trial of its matching LIBERO-Plus task,
+        allowing the existing ordered evaluation pool to enumerate every
+        category item exactly once.
+        """
+        classification_path = os.path.abspath(
+            os.path.expanduser(str(self.plus_classification_path))
+        )
+        if not os.path.isfile(classification_path):
+            raise FileNotFoundError(
+                "LIBERO-Plus task classification file does not exist: "
+                f"{classification_path}"
+            )
+
+        with open(classification_path, "r", encoding="utf-8") as f:
+            classification = json.load(f)
+
+        suite_name = str(self.cfg.task_suite_name).lower()
+        if suite_name not in classification:
+            available = ", ".join(sorted(classification))
+            raise KeyError(
+                f"Suite {suite_name!r} is absent from {classification_path}. "
+                f"Available suites: {available}"
+            )
+
+        requested_category = str(self.plus_category).strip()
+        category_lookup = {
+            str(entry.get("category", "")).strip().casefold(): str(
+                entry.get("category", "")
+            ).strip()
+            for entry in classification[suite_name]
+            if entry.get("category")
+        }
+        canonical_category = category_lookup.get(requested_category.casefold())
+        if canonical_category is None:
+            available = ", ".join(sorted(set(category_lookup.values())))
+            raise KeyError(
+                f"Category {requested_category!r} is absent from suite "
+                f"{suite_name!r}. Available categories: {available}"
+            )
+
+        import liberoplus.liberoplus as l_plus
+
+        _repoint_libero_config(l_plus)
+        bddl_root = os.path.abspath(l_plus.get_libero_path("bddl_files"))
+        suite_bddl_root = os.path.join(bddl_root, suite_name)
+        if not os.path.isdir(suite_bddl_root):
+            raise FileNotFoundError(
+                f"LIBERO-Plus BDDL suite directory does not exist: "
+                f"{suite_bddl_root}"
+            )
+
+        suite_tasks_by_name = {}
+        for task_id in range(self.task_suite.get_num_tasks()):
+            task = self.task_suite.get_task(task_id)
+            task_name = str(getattr(task, "name", "")).strip()
+            if not task_name:
+                task_name = os.path.splitext(os.path.basename(task.bddl_file))[0]
+            if task_name in suite_tasks_by_name:
+                raise RuntimeError(
+                    f"Duplicate task name {task_name!r} in LIBERO-Plus suite "
+                    f"{suite_name!r}."
+                )
+            suite_tasks_by_name[task_name] = (task_id, task)
+
+        manifest_by_task = {
+            task_id: [] for task_id in range(self.task_suite.get_num_tasks())
+        }
+        missing_bddls = []
+        unmatched_names = []
+        duplicate_names = []
+        seen_names = set()
+
+        selected = [
+            entry
+            for entry in classification[suite_name]
+            if str(entry.get("category", "")).strip().casefold()
+            == canonical_category.casefold()
+        ]
+
+        for entry in selected:
+            raw_name = str(entry.get("name", "")).strip()
+            name = raw_name[:-5] if raw_name.endswith(".bddl") else raw_name
+            if not name:
+                unmatched_names.append(raw_name)
+                continue
+            if name in seen_names:
+                duplicate_names.append(name)
+                continue
+            seen_names.add(name)
+
+            suite_task = suite_tasks_by_name.get(name)
+            if suite_task is None:
+                unmatched_names.append(name)
+                continue
+
+            matching_task_id, task = suite_task
+
+            bddl_path, source_bddl_path, virtual_bddl = _resolve_plus_bddl_paths(
+                bddl_root, task.problem_folder, name
+            )
+            if not os.path.isfile(source_bddl_path):
+                missing_bddls.append(source_bddl_path)
+                continue
+
+            record = {
+                "classification_id": int(entry["id"]),
+                "name": name,
+                "category": canonical_category,
+                "difficulty_level": entry.get("difficulty_level", None),
+                "suite_task_id": matching_task_id,
+                "bddl_path": os.path.abspath(bddl_path),
+                "source_bddl_path": os.path.abspath(source_bddl_path),
+                "virtual_bddl": virtual_bddl,
+                "local_trial_id": 0,
+            }
+            manifest_by_task[matching_task_id].append(record)
+
+        if self.plus_strict_manifest and (
+            missing_bddls or unmatched_names or duplicate_names
+        ):
+            details = []
+            if missing_bddls:
+                details.append(
+                    f"missing_bddls={len(missing_bddls)} "
+                    f"examples={missing_bddls[:3]}"
+                )
+            if unmatched_names:
+                details.append(
+                    f"unmatched_names={len(unmatched_names)} "
+                    f"examples={unmatched_names[:3]}"
+                )
+            if duplicate_names:
+                details.append(
+                    f"duplicate_names={len(duplicate_names)} "
+                    f"examples={duplicate_names[:3]}"
+                )
+            raise RuntimeError(
+                "Invalid LIBERO-Plus category manifest: " + "; ".join(details)
+            )
+
+        multiple_records = {
+            task_id: records
+            for task_id, records in manifest_by_task.items()
+            if len(records) > 1
+        }
+        if multiple_records:
+            examples = {
+                task_id: [record["name"] for record in records]
+                for task_id, records in list(multiple_records.items())[:3]
+            }
+            raise RuntimeError(
+                "Each LIBERO-Plus suite task must map to at most one official "
+                f"classification record; duplicates found: {examples}"
+            )
+
+        loaded_count = sum(len(records) for records in manifest_by_task.values())
+        expected_count = self.plus_expected_num_tasks
+        if expected_count is not None and loaded_count != int(expected_count):
+            raise RuntimeError(
+                f"LIBERO-Plus category {canonical_category!r} for "
+                f"{suite_name!r} loaded {loaded_count} tasks, expected "
+                f"{int(expected_count)}."
+            )
+        if loaded_count == 0:
+            raise RuntimeError(
+                f"LIBERO-Plus category {canonical_category!r} for "
+                f"{suite_name!r} contains no usable BDDL tasks."
+            )
+
+        self.plus_category = canonical_category
+        self.plus_classification_path = classification_path
+        self._plus_manifest_by_task = manifest_by_task
+        selected_suite_task_ids = [
+            task_id for task_id, records in manifest_by_task.items() if records
+        ]
+        virtual_count = sum(
+            int(record["virtual_bddl"])
+            for records in manifest_by_task.values()
+            for record in records
+        )
+        logger.info(
+            "[LIBERO-PLUS manifest] loaded suite=%s category=%r tasks=%s "
+            "suite_task_id_range=%s..%s virtual_tasks=%s source=%s",
+            suite_name,
+            canonical_category,
+            loaded_count,
+            min(selected_suite_task_ids),
+            max(selected_suite_task_ids),
+            virtual_count,
+            classification_path,
+        )
+
+    def _get_plus_manifest_entry(self, task_id: int, trial_id: int) -> dict:
+        if not self._uses_plus_category_manifest:
+            raise RuntimeError("LIBERO-Plus category manifest is not enabled.")
+        records = self._plus_manifest_by_task[int(task_id)]
+        if trial_id < 0 or trial_id >= len(records):
+            raise IndexError(
+                f"Invalid LIBERO-Plus local trial {trial_id} for base task "
+                f"{task_id}; valid range is [0, {len(records) - 1}]."
+            )
+        return records[int(trial_id)]
 
     def _init_env(self):
         env_fns = self.get_env_fns()
@@ -291,6 +566,7 @@ class LiberoEnv(gym.Env):
 
         task_descriptions = []
         pert_init_folders = []
+        plus_manifest_entries = []
         if env_idx is None:
             env_idx = np.arange(self.num_envs)
 
@@ -306,6 +582,11 @@ class LiberoEnv(gym.Env):
                     if hasattr(self, "_pert_init_folders")
                     else ""
                 )
+                plus_manifest_entries.append(
+                    self._plus_manifest_entries[env_id]
+                    if self._plus_manifest_entries is not None
+                    else None
+                )
                 continue
 
             task = self.task_suite.get_task(self.task_ids[env_id])
@@ -314,8 +595,27 @@ class LiberoEnv(gym.Env):
             original_path = os.path.join(bddl_root, folder_name, file_name)
 
             final_path = original_path
+            plus_manifest_entry = None
 
-            if variant == "pro":
+            if variant == "plus" and self._uses_plus_category_manifest:
+                plus_manifest_entry = self._get_plus_manifest_entry(
+                    int(self.task_ids[env_id]), int(self.trial_ids[env_id])
+                )
+                final_path = plus_manifest_entry["bddl_path"]
+                if self.is_eval:
+                    logger.info(
+                        "[LIBERO-PLUS manifest task] env=%s "
+                        "classification_id=%s task_id=%s trial_id=%s "
+                        "category=%r bddl=%s",
+                        env_id,
+                        plus_manifest_entry["classification_id"],
+                        self.task_ids[env_id],
+                        self.trial_ids[env_id],
+                        plus_manifest_entry["category"],
+                        final_path,
+                    )
+
+            elif variant == "pro":
                 pro_suffix = raw_suffix.replace(".bddl", "") if raw_suffix else None
 
                 valid_perts = ["_lan", "_object", "_swap", "_task"]
@@ -435,6 +735,8 @@ class LiberoEnv(gym.Env):
                         else:
                             final_path = self._generator.choice(all_candidates)
 
+            plus_manifest_entries.append(plus_manifest_entry)
+
             env_fn_params.append(
                 {
                     **base_env_args,
@@ -446,11 +748,18 @@ class LiberoEnv(gym.Env):
             # and remember the perturbation folder for pruned_init loading.
             pert_folder = os.path.basename(os.path.dirname(os.path.abspath(final_path)))
             pert_init_folders.append(pert_folder)
-            if variant == "pro":
-                bddl_lang, bddl_goal = _read_bddl_language_and_goal(final_path)
+            if variant == "pro" or plus_manifest_entry is not None:
+                prompt_bddl_path = (
+                    plus_manifest_entry.get("source_bddl_path", final_path)
+                    if plus_manifest_entry is not None
+                    else final_path
+                )
+                bddl_lang, bddl_goal = _read_bddl_language_and_goal(
+                    prompt_bddl_path
+                )
                 desc = bddl_lang if bddl_lang else task.language
                 task_descriptions.append(desc)
-                if self.is_eval:
+                if self.is_eval and variant == "pro":
                     logger.info(
                         "[LIBERO-PRO lang] env=%s pert_folder=%s "
                         "prompt=%r suite_orig=%r bddl_lang=%r goal=%r bddl=%s",
@@ -467,15 +776,22 @@ class LiberoEnv(gym.Env):
 
         self.task_descriptions = task_descriptions
         self._pert_init_folders = pert_init_folders
+        self._plus_manifest_entries = plus_manifest_entries
         return env_fn_params
 
     def _compute_total_num_group_envs(self):
         self.total_num_group_envs = 0
         self.trial_id_bins = []
-        for task_id in range(self.task_suite.get_num_tasks()):
-            task_num_trials = len(self.task_suite.get_task_init_states(task_id))
-            self.trial_id_bins.append(task_num_trials)
-            self.total_num_group_envs += task_num_trials
+        if self._uses_plus_category_manifest:
+            for task_id in range(self.task_suite.get_num_tasks()):
+                task_num_trials = len(self._plus_manifest_by_task[task_id])
+                self.trial_id_bins.append(task_num_trials)
+                self.total_num_group_envs += task_num_trials
+        else:
+            for task_id in range(self.task_suite.get_num_tasks()):
+                task_num_trials = len(self.task_suite.get_task_init_states(task_id))
+                self.trial_id_bins.append(task_num_trials)
+                self.total_num_group_envs += task_num_trials
         self.cumsum_trial_id_bins = np.cumsum(self.trial_id_bins)
 
         if self.task_id_filter is not None:
@@ -747,6 +1063,14 @@ class LiberoEnv(gym.Env):
         episode_info["reward"] = episode_info["return"] / np.maximum(
             episode_len_for_reward, 1
         )
+        if self._uses_plus_category_manifest and self._plus_manifest_entries:
+            episode_info["plus_classification_id"] = np.asarray(
+                [
+                    int(entry["classification_id"]) if entry is not None else -1
+                    for entry in self._plus_manifest_entries
+                ],
+                dtype=np.int64,
+            )
         infos["episode"] = to_tensor(episode_info)
         return infos
 
@@ -797,9 +1121,11 @@ class LiberoEnv(gym.Env):
         )
         for j, env_id in enumerate(env_idx):
             task_changed = self.task_ids[env_id] != task_ids[j]
+            trial_changed = self.trial_ids[env_id] != trial_ids[j]
             self.task_ids[env_id] = task_ids[j]
             self.trial_ids[env_id] = trial_ids[j]
-            if task_changed or not self.is_eval:
+            manifest_changed = self._uses_plus_category_manifest and trial_changed
+            if task_changed or manifest_changed or not self.is_eval:
                 reconfig_env_idx.append(env_id)
         if reconfig_env_idx:
             env_fn_params = self.get_env_fn_params(reconfig_env_idx)
