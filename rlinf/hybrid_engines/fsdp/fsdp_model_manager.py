@@ -18,7 +18,7 @@ from typing import ContextManager, Union
 
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
@@ -118,6 +118,7 @@ class FSDPModelManager:
         self.bucket_capacity = cfg.get("sync_bucket_capacity", 128 * 1024 * 1024)
 
         self.param_names_need_sync: list[str] = None
+        self.trainable_param_names: set[str] = set()
 
     def _create_amp_context(self) -> ContextManager:
         """
@@ -304,6 +305,13 @@ class FSDPModelManager:
 
         # here record the original trainable parameters' names before FSDP wrapping
         # persist buffers' names are also recorded, which will be used for weight syncing.
+        self.trainable_param_names = {
+            name
+            for name, parameter in module.named_parameters(remove_duplicate=False)
+            if parameter.requires_grad
+        }
+        if not self.trainable_param_names:
+            raise RuntimeError("The model has no trainable parameters.")
         self.param_names_need_sync = collect_param_names_need_sync(module)
 
         # build model, optimizer, lr_scheduler, grad_scaler
@@ -410,6 +418,81 @@ class FSDPModelManager:
             self.offload_param_and_grad()
         if restore_optimizer_offload:
             self.offload_optimizer()
+
+    def save_trainable_checkpoint(self, save_path: str, step: int = 0) -> None:
+        """Save only parameters that were trainable before FSDP wrapping.
+
+        This lightweight checkpoint is intended for evaluation or warm-starting
+        another run. It intentionally excludes optimizer, scheduler, and RNG
+        state, so it is not an exact replacement for a full resume checkpoint.
+        """
+
+        restore_weight_offload = self.is_weight_offloaded
+        if restore_weight_offload:
+            self.load_param_and_grad(self.device)
+
+        try:
+            full_state_dict = self.get_model_state_dict(
+                cpu_offload=True,
+                full_state_dict=True,
+            )
+            save_error = [None]
+            if torch.distributed.get_rank() == 0:
+                try:
+                    trainable_state_dict = {
+                        name: value
+                        for name, value in full_state_dict.items()
+                        if name in self.trainable_param_names
+                    }
+                    missing_names = sorted(
+                        self.trainable_param_names - set(trainable_state_dict)
+                    )
+                    if missing_names:
+                        raise RuntimeError(
+                            "Trainable parameters were missing from the full "
+                            f"state dict: {missing_names[:20]}"
+                        )
+
+                    output_dir = os.path.join(
+                        save_path, "trainable_model_state_dict"
+                    )
+                    os.makedirs(output_dir, exist_ok=True)
+                    output_path = os.path.join(
+                        output_dir, "trainable_weights.pt"
+                    )
+                    payload = {
+                        "format_version": 1,
+                        "global_step": int(step),
+                        "base_model_path": str(self._cfg.model.model_path),
+                        "model_config": OmegaConf.to_container(
+                            self._cfg.model, resolve=True
+                        ),
+                        "trainable_param_names": sorted(trainable_state_dict),
+                        "state_dict": trainable_state_dict,
+                    }
+                    torch.save(payload, output_path)
+                    parameter_count = sum(
+                        value.numel()
+                        for value in trainable_state_dict.values()
+                        if isinstance(value, torch.Tensor)
+                    )
+                    self._logger.info(
+                        "Saved trainable-only checkpoint to "
+                        f"{output_path}: {len(trainable_state_dict)} tensors, "
+                        f"{parameter_count:,} parameters"
+                    )
+                except Exception as error:
+                    save_error[0] = f"{type(error).__name__}: {error}"
+
+            torch.distributed.broadcast_object_list(save_error, src=0)
+            if save_error[0] is not None:
+                raise RuntimeError(
+                    "Failed to save trainable-only checkpoint: " + save_error[0]
+                )
+            torch.distributed.barrier()
+        finally:
+            if restore_weight_offload:
+                self.offload_param_and_grad()
 
     def offload_param_and_grad(self, offload_grad: bool = False) -> None:
         """

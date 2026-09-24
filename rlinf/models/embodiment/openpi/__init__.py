@@ -20,6 +20,79 @@ import torch
 from omegaconf import DictConfig
 
 
+def _resolve_trainable_checkpoint(path: str | os.PathLike[str]) -> pathlib.Path:
+    requested_path = pathlib.Path(path).expanduser()
+    candidates = [
+        requested_path,
+        requested_path / "trainable_weights.pt",
+        requested_path
+        / "trainable_model_state_dict"
+        / "trainable_weights.pt",
+        requested_path
+        / "actor"
+        / "trainable_model_state_dict"
+        / "trainable_weights.pt",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    checked = "\n  - ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        "Could not find a trainable-only checkpoint. Checked:\n  - " + checked
+    )
+
+
+def _load_trainable_checkpoint(model: torch.nn.Module, path: str) -> pathlib.Path:
+    checkpoint_path = _resolve_trainable_checkpoint(path)
+    payload = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    if not isinstance(payload, dict):
+        raise TypeError(
+            f"Trainable checkpoint must be a dictionary, got {type(payload)!r}."
+        )
+    state_dict = payload.get("state_dict", payload)
+    if not isinstance(state_dict, dict) or not state_dict:
+        raise ValueError(
+            f"No state_dict tensors found in trainable checkpoint {checkpoint_path}."
+        )
+
+    model_keys = set(model.state_dict())
+    loadable_state_dict = {
+        name: value for name, value in state_dict.items() if name in model_keys
+    }
+    skipped_keys = sorted(set(state_dict) - set(loadable_state_dict))
+    disallowed_skipped_keys = [
+        name for name in skipped_keys if not name.startswith("value_head.")
+    ]
+    if disallowed_skipped_keys:
+        raise RuntimeError(
+            "Trainable checkpoint contains parameters absent from the configured "
+            f"model: {disallowed_skipped_keys[:20]}. Ensure the visual adapter "
+            "configuration matches training."
+        )
+    if not loadable_state_dict:
+        raise RuntimeError(
+            f"No checkpoint parameters match the configured model: {checkpoint_path}"
+        )
+
+    model.load_state_dict(loadable_state_dict, strict=False)
+    logger = getattr(model, "logger", None)
+    message = (
+        f"Loaded {len(loadable_state_dict)} trainable tensors from "
+        f"{checkpoint_path}"
+    )
+    if skipped_keys:
+        message += f"; skipped {len(skipped_keys)} value-head tensors"
+    if logger is not None:
+        logger.info(message)
+    else:
+        print(message)
+    return checkpoint_path
+
+
 def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
 
@@ -87,7 +160,13 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             all_state_dict.update(state_dict)
         model.load_state_dict(all_state_dict, strict=False)
 
+    trainable_checkpoint_path = getattr(cfg, "trainable_checkpoint_path", None)
+    if trainable_checkpoint_path is not None:
+        _load_trainable_checkpoint(model, str(trainable_checkpoint_path))
+
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    model.align_visual_adaptation_dtype()
+    model.configure_adaptation_trainability()
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()
     # load data stats

@@ -42,3 +42,17 @@ RLinf/evaluations/libero/libero_goal_pi0_eval.yaml
 
 # feature/pi0-liberoplus-adapter-ppo
 commit: 968d1ab04b006b7c4da8e4095f43fdc63cdaeaa9
+commit: 011fececd4e6161e0582289cffd6c11b59bfda19
+
+## 新增
+RLinf/evaluations/libero/libero_goal_pi0_visual_adapter_eval.yaml
+RLinf/examples/embodiment/config/libero_goal_ppo_pi0_visual_adapter.yaml
+RLinf/rlinf/models/embodiment/openpi/visual_adaptation.py
+RLinf/tests/models/embodiment/openpi/test_visual_adaptation.py
+
+## 修改
+RLinf/examples/embodiment/config/model/pi0.yaml
+RLinf/rlinf/hybrid_engines/fsdp/fsdp_model_manager.py
+RLinf/rlinf/models/embodiment/openpi/__init__.py
+RLinf/rlinf/models/embodiment/openpi/openpi_action_model.py
+RLinf/rlinf/runners/embodied_runner.py

@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+#   bash train_pi0_last_layer_adapter_ppo.sh
+#   MAX_STEPS=20 SAVE_INTERVAL=10 bash train_pi0_last_layer_adapter_ppo.sh
+#   LIBERO_CATEGORY="Sensor Noise" bash train_pi0_last_layer_adapter_ppo.sh
+#   LIBERO_TYPE=standard bash train_pi0_last_layer_adapter_ppo.sh
+
+RLINF_ROOT="${RLINF_ROOT:-/data/Xixixi/VLA1/RLinf}"
+PI0_MODEL="${PI0_MODEL:-/data/Xixixi/VLA1/model_cache/openpi/openpi-assets/checkpoints/pi0_libero_pytorch}"
+CONFIG_NAME="${CONFIG_NAME:-libero_goal_ppo_pi0_visual_adapter}"
+
+# LIBERO-Plus selection. Set LIBERO_TYPE=standard for standard LIBERO.
+export LIBERO_TYPE="${LIBERO_TYPE:-plus}"
+export LIBERO_CATEGORY="${LIBERO_CATEGORY:-Objects Layout}"
+export LIBERO_CLASSIFICATION_PATH="${LIBERO_CLASSIFICATION_PATH:-/data/Xixixi/VLA1/LIBERO-plus/libero/libero/benchmark/task_classification.json}"
+
+# One H100 with about 50 GiB currently available. MICRO_BATCH_SIZE is the
+# primary training-memory control; NUM_ENVS also affects rollout inference.
+NUM_ENVS="${NUM_ENVS:-8}"
+ROLLOUT_EPOCH="${ROLLOUT_EPOCH:-2}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-1}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-60}"
+MAX_STEPS="${MAX_STEPS:-200}"
+SAVE_INTERVAL="${SAVE_INTERVAL:-20}"
+VAL_INTERVAL="${VAL_INTERVAL:-20}"
+SEED="${SEED:-7}"
+
+ADAPTER_DIM="${ADAPTER_DIM:-64}"
+ADAPTER_DROPOUT="${ADAPTER_DROPOUT:-0.0}"
+ADAPTER_LR="${ADAPTER_LR:-5.0e-5}"
+VALUE_LR="${VALUE_LR:-1.0e-4}"
+TRAIN_ACTION_EXPERT="${TRAIN_ACTION_EXPERT:-0}"
+
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
+export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export PYTHONUNBUFFERED=1
+export HYDRA_FULL_ERROR=1
+export ROBOT_PLATFORM=LIBERO
+export PYTHONHASHSEED="${SEED}"
+
+# W&B authentication for this training script
+export WANDB_MODE="online"
+export WANDB_API_KEY='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'
+export WANDB_ENTITY='wangxixixi0627-iscas'
+export WANDB_PROJECT='RLinf'
+
+export EMBODIED_PATH="${RLINF_ROOT}/examples/embodiment"
+export PYTHONPATH="${RLINF_ROOT}:${PYTHONPATH:-}"
+
+# ============================================================
+# Temporary W&B authentication
+# ============================================================
+
+export WANDB_MODE="${WANDB_MODE:-online}"
+
+if [[ "${WANDB_MODE}" == "online" ]]; then
+  if [[ -z "${WANDB_API_KEY:-}" ]]; then
+    if [[ ! -t 0 ]]; then
+      echo "WANDB_API_KEY is unset and no interactive terminal is available." >&2
+      exit 1
+    fi
+
+    read -rsp "Enter W&B API key: " WANDB_API_KEY
+    echo
+
+    if [[ -z "${WANDB_API_KEY}" ]]; then
+      echo "W&B API key cannot be empty." >&2
+      exit 1
+    fi
+
+    export WANDB_API_KEY
+  fi
+
+  # 可选。不设置时使用当前 API key 对应账号的默认 entity。
+  if [[ -n "${WANDB_ENTITY:-}" ]]; then
+    export WANDB_ENTITY
+    echo "WANDB_ENTITY=${WANDB_ENTITY}"
+  else
+    echo "WANDB_ENTITY=<account default>"
+  fi
+else
+  echo "WANDB_MODE=${WANDB_MODE}"
+fi
+
+cd "${RLINF_ROOT}"
+
+test -s "${PI0_MODEL}/model.safetensors"
+test -s "${PI0_MODEL}/config.json"
+test -s "${PI0_MODEL}/assets/physical-intelligence/libero/norm_stats.json"
+test -s "examples/embodiment/config/${CONFIG_NAME}.yaml"
+test -s "rlinf/models/embodiment/openpi/visual_adaptation.py"
+
+if [[ "${LIBERO_TYPE}" == "plus" ]]; then
+  test -s "${LIBERO_CLASSIFICATION_PATH}"
+  unset LIBERO_SUFFIX || true
+  unset LIBERO_PERTURBATION || true
+else
+  unset LIBERO_CATEGORY || true
+  unset LIBERO_CLASSIFICATION_PATH || true
+  unset LIBERO_SUFFIX || true
+  unset LIBERO_PERTURBATION || true
+fi
+
+# Existing RLinf/Ray jobs are not stopped unless explicitly requested.
+if [[ "${RESET_RAY:-0}" == "1" ]]; then
+  ray stop --force >/dev/null 2>&1 || true
+fi
+
+TIMESTAMP="$(date +'%Y%m%d-%H%M%S')"
+CATEGORY_TAG="${LIBERO_CATEGORY:-Objects Layout}"
+CATEGORY_TAG="${CATEGORY_TAG// /_}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-pi0_last_adapter_${CATEGORY_TAG}_ppo}"
+RUN_DIR="${RUN_DIR:-${RLINF_ROOT}/results/pi0/adapter_ppo/${CONFIG_NAME}/${TIMESTAMP}}"
+mkdir -p "${RUN_DIR}"
+
+if [[ "${TRAIN_ACTION_EXPERT}" == "1" ]]; then
+  ACTION_EXPERT_FLAG=true
+else
+  ACTION_EXPERT_FLAG=false
+fi
+
+CMD=(
+  python "${EMBODIED_PATH}/train_embodied_agent.py"
+  --config-path "${EMBODIED_PATH}/config/"
+  --config-name "${CONFIG_NAME}"
+
+  "++weight_syncer.patch.transport_device=cpu"
+
+  "runner.checkpoint_mode=trainable_only"
+  "runner.logger.log_path=${RUN_DIR}"
+  "runner.logger.experiment_name=${EXPERIMENT_NAME}"
+  "runner.max_steps=${MAX_STEPS}"
+  "runner.save_interval=${SAVE_INTERVAL}"
+  "runner.val_check_interval=${VAL_INTERVAL}"
+
+  "actor.model.model_path=${PI0_MODEL}"
+  "actor.model.trainable_checkpoint_path=null"
+  "rollout.model.model_path=${PI0_MODEL}"
+
+  "actor.model.openpi.train_expert_only=true"
+  "actor.model.openpi.train_action_expert=${ACTION_EXPERT_FLAG}"
+  "actor.model.openpi.train_action_head=false"
+
+  "actor.model.openpi.visual_adaptation.backbone.type=last_layer_adapter"
+  "actor.model.openpi.visual_adaptation.backbone.last_layer_adapter.bottleneck_dim=${ADAPTER_DIM}"
+  "actor.model.openpi.visual_adaptation.backbone.last_layer_adapter.dropout=${ADAPTER_DROPOUT}"
+  "actor.model.openpi.visual_adaptation.backbone.last_layer_adapter.residual_scale=1.0"
+  "actor.model.openpi.visual_adaptation.ftm.enabled=false"
+
+  "actor.model.openpi.noise_method=flow_sde"
+  "actor.model.openpi.noise_level=0.5"
+
+  "actor.optim.lr=${ADAPTER_LR}"
+  "actor.optim.value_lr=${VALUE_LR}"
+  "actor.micro_batch_size=${MICRO_BATCH_SIZE}"
+  "actor.global_batch_size=${GLOBAL_BATCH_SIZE}"
+  "actor.seed=${SEED}"
+
+  # Adapter-only 训练必须开启
+  "actor.fsdp_config.use_orig_params=true"
+
+  "env.train.seed=${SEED}"
+  "env.train.total_num_envs=${NUM_ENVS}"
+  "env.train.rollout_epoch=${ROLLOUT_EPOCH}"
+  "env.train.max_episode_steps=300"
+  "env.train.max_steps_per_rollout_epoch=300"
+  "env.train.video_cfg.save_video=false"
+
+  "env.eval.seed=${SEED}"
+  "env.eval.total_num_envs=10"
+  "env.eval.rollout_epoch=1"
+  "env.eval.max_episode_steps=300"
+  "env.eval.max_steps_per_rollout_epoch=300"
+  "env.eval.video_cfg.save_video=false"
+)
+
+echo "RLINF_ROOT=${RLINF_ROOT}"
+echo "PI0_MODEL=${PI0_MODEL}"
+echo "LIBERO_TYPE=${LIBERO_TYPE}"
+echo "LIBERO_CATEGORY=${LIBERO_CATEGORY:-standard}"
+echo "Adapter=last_layer, dim=${ADAPTER_DIM}, FTM=false"
+echo "train_action_expert=${ACTION_EXPERT_FLAG}, train_action_head=false"
+echo "checkpoint_mode=trainable_only"
+echo "num_envs=${NUM_ENVS}, rollout_epoch=${ROLLOUT_EPOCH}"
+echo "micro_batch=${MICRO_BATCH_SIZE}, global_batch=${GLOBAL_BATCH_SIZE}"
+echo "run_dir=${RUN_DIR}"
+
+printf 'Command:'
+printf ' %q' "${CMD[@]}"
+printf '\n'
+
+"${CMD[@]}" 2>&1 | tee "${RUN_DIR}/train.log"

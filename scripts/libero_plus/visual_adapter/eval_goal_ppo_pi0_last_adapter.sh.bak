@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RLINF_ROOT="${RLINF_ROOT:-/data/Xixixi/VLA1/RLinf}"
+PI0_MODEL="${PI0_MODEL:-/data/Xixixi/VLA1/model_cache/openpi/openpi-assets/checkpoints/pi0_libero_pytorch}"
+
+TRAIN_RUN_ROOT="${TRAIN_RUN_ROOT:-/data/Xixixi/VLA1/RLinf/results/pi0/adapter_ppo/libero_goal_ppo_openpi_visual_adapter/20260922-135509}"
+ADAPTER_CKPT="${ADAPTER_CKPT:-}"
+
+CATEGORY="${CATEGORY:-Objects Layout}"
+CLASSIFICATION_PATH="${CLASSIFICATION_PATH:-/data/Xixixi/VLA1/LIBERO-plus/libero/libero/benchmark/task_classification.json}"
+
+# EVAL_ALL=0: smoke，只评 NUM_ENVS 个任务
+# EVAL_ALL=1: 完整遍历该类别
+EVAL_ALL="${EVAL_ALL:-1}"
+NUM_ENVS="${NUM_ENVS:-25}"
+ROLLOUT_EPOCH="${ROLLOUT_EPOCH:-17}"
+SEED="${SEED:-7}"
+SAVE_VIDEO="${SAVE_VIDEO:-false}"
+
+ADAPTER_DIM="${ADAPTER_DIM:-64}"
+ADAPTER_DROPOUT="${ADAPTER_DROPOUT:-0.0}"
+ADAPTER_RESIDUAL_SCALE="${ADAPTER_RESIDUAL_SCALE:-1.0}"
+
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
+export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
+export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export PYTHONUNBUFFERED=1
+export HYDRA_FULL_ERROR=1
+export ROBOT_PLATFORM=LIBERO
+
+export LIBERO_TYPE=plus
+export LIBERO_CATEGORY="${CATEGORY}"
+export LIBERO_CLASSIFICATION_PATH="${CLASSIFICATION_PATH}"
+
+unset LIBERO_PERTURBATION || true
+unset LIBERO_SUFFIX || true
+
+cd "${RLINF_ROOT}"
+
+test -s "${PI0_MODEL}/model.safetensors"
+test -s "${PI0_MODEL}/config.json"
+test -s "${PI0_MODEL}/assets/physical-intelligence/libero/norm_stats.json"
+test -s "${CLASSIFICATION_PATH}"
+test -s "evaluations/libero/libero_goal_pi0_visual_adapter_eval.yaml"
+
+# 自动选择最新 trainable-only checkpoint。
+if [[ -z "${ADAPTER_CKPT}" ]]; then
+  ADAPTER_CKPT="$(
+    find "${TRAIN_RUN_ROOT}" \
+      -type f \
+      -path "*/actor/trainable_model_state_dict/trainable_weights.pt" \
+      | sort -V \
+      | tail -n 1
+  )"
+fi
+
+if [[ -z "${ADAPTER_CKPT}" || ! -s "${ADAPTER_CKPT}" ]]; then
+  echo "ERROR: trainable_weights.pt not found under:" >&2
+  echo "  ${TRAIN_RUN_ROOT}" >&2
+  exit 1
+fi
+
+export ADAPTER_CKPT
+
+# 检查 checkpoint 确实包含 last-layer Adapter。
+python - <<'PY'
+import os
+import torch
+
+path = os.environ["ADAPTER_CKPT"]
+payload = torch.load(path, map_location="cpu", weights_only=True)
+state = payload.get("state_dict", payload)
+
+adapter_keys = [
+    key for key in state
+    if "visual_last_layer_adapter" in key
+]
+value_keys = [
+    key for key in state
+    if "value_head" in key
+]
+
+assert adapter_keys, (
+    "Checkpoint does not contain visual_last_layer_adapter parameters: "
+    f"{path}"
+)
+
+print("Adapter checkpoint:", path)
+print("Global step:", payload.get("global_step"))
+print("Saved tensors:", len(state))
+print("Adapter tensors:", len(adapter_keys))
+print("Value-head tensors:", len(value_keys))
+print(
+    "Saved parameters:",
+    sum(value.numel() for value in state.values()),
+)
+PY
+
+# 统计当前 suite/category 的完整任务数。
+export CATEGORY
+export CLASSIFICATION_PATH
+
+TASK_COUNT="$(
+python - <<'PY'
+import json
+import os
+
+path = os.environ["CLASSIFICATION_PATH"]
+category = os.environ["CATEGORY"].strip().casefold()
+suite = "libero_goal"
+
+with open(path, "r", encoding="utf-8") as file:
+    manifest = json.load(file)
+
+selected = [
+    entry
+    for entry in manifest[suite]
+    if str(entry.get("category", "")).strip().casefold() == category
+]
+
+names = {
+    str(entry["name"]).removesuffix(".bddl")
+    for entry in selected
+}
+
+print(len(names))
+PY
+)"
+
+if (( TASK_COUNT <= 0 )); then
+  echo "ERROR: no tasks selected for category '${CATEGORY}'" >&2
+  exit 1
+fi
+
+if [[ "${EVAL_ALL}" == "1" ]]; then
+  ROLLOUT_EPOCH=$(( (TASK_COUNT + NUM_ENVS - 1) / NUM_ENVS ))
+fi
+
+CATEGORY_TAG="${CATEGORY// /_}"
+CKPT_STEP="$(
+python - <<'PY'
+import os
+import torch
+
+payload = torch.load(
+    os.environ["ADAPTER_CKPT"],
+    map_location="cpu",
+    weights_only=True,
+)
+print(payload.get("global_step", "unknown"))
+PY
+)"
+
+LOG_ROOT="${LOG_ROOT:-${RLINF_ROOT}/results/pi0/adapter_eval/last_adapter/${CATEGORY_TAG}/step_${CKPT_STEP}}"
+
+echo "============================================================"
+echo "PI0_MODEL=${PI0_MODEL}"
+echo "ADAPTER_CKPT=${ADAPTER_CKPT}"
+echo "CATEGORY=${CATEGORY}"
+echo "TASK_COUNT=${TASK_COUNT}"
+echo "NUM_ENVS=${NUM_ENVS}"
+echo "ROLLOUT_EPOCH=${ROLLOUT_EPOCH}"
+echo "EVAL_ALL=${EVAL_ALL}"
+echo "LOG_ROOT=${LOG_ROOT}"
+echo "============================================================"
+
+# 只能在训练释放 GPU 后运行。
+if [[ "${RESET_RAY:-1}" == "1" ]]; then
+  ray stop --force >/dev/null 2>&1 || true
+fi
+
+LOG_ROOT="${LOG_ROOT}" \
+bash evaluations/run_eval.sh \
+  libero \
+  libero_goal_pi0_visual_adapter_eval \
+  "rollout.model.model_path=${PI0_MODEL}" \
+  "rollout.model.trainable_checkpoint_path=${ADAPTER_CKPT}" \
+  "rollout.model.add_value_head=false" \
+  "rollout.model.openpi.train_expert_only=true" \
+  "rollout.model.openpi.train_action_expert=false" \
+  "rollout.model.openpi.train_action_head=false" \
+  "rollout.model.openpi.visual_adaptation.backbone.type=last_layer_adapter" \
+  "rollout.model.openpi.visual_adaptation.backbone.last_layer_adapter.bottleneck_dim=${ADAPTER_DIM}" \
+  "rollout.model.openpi.visual_adaptation.backbone.last_layer_adapter.dropout=${ADAPTER_DROPOUT}" \
+  "rollout.model.openpi.visual_adaptation.backbone.last_layer_adapter.residual_scale=${ADAPTER_RESIDUAL_SCALE}" \
+  "rollout.model.openpi.visual_adaptation.ftm.enabled=false" \
+  "rollout.model.openpi.noise_method=flow_ode" \
+  "rollout.model.openpi.noise_level=0.0" \
+  "runner.logger.experiment_name=pi0_last_adapter_${CATEGORY_TAG}_step_${CKPT_STEP}" \
+  "env.eval.seed=${SEED}" \
+  "env.eval.group_size=1" \
+  "env.eval.total_num_envs=${NUM_ENVS}" \
+  "env.eval.rollout_epoch=${ROLLOUT_EPOCH}" \
+  "env.eval.max_episode_steps=300" \
+  "env.eval.max_steps_per_rollout_epoch=300" \
+  "env.eval.video_cfg.save_video=${SAVE_VIDEO}"

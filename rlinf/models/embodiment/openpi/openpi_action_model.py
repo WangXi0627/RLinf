@@ -37,6 +37,12 @@ from rlinf.models.embodiment.openpi.rtc_guidance import (
 from rlinf.models.embodiment.openpi.rtc_guidance import (
     sample_actions_with_rtc_guidance as _sample_actions_with_rtc_guidance,
 )
+from rlinf.models.embodiment.openpi.visual_adaptation import (
+    align_visual_adaptation_dtype,
+    install_visual_adaptation,
+    iter_visual_adaptation_parameters,
+    visual_adaptation_enabled,
+)
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 from rlinf.utils.pytree import register_pytree_dataclasses
@@ -73,6 +79,11 @@ class OpenPi0Config(Pi0Config):
     rtc_guidance_clip: float = 5.0
     # training config
     train_expert_only: bool = False
+    # None keeps the legacy train_expert_only behavior. Setting either switch
+    # opts into explicit parameter selection for adapter/FTM experiments.
+    train_action_expert: bool | None = None
+    train_action_head: bool | None = None
+    visual_adaptation: dict[str, Any] = field(default_factory=dict)
     safe_get_logprob: bool = False
     joint_logprob: bool = False  # designed for flow-noise
     double_layer: bool = False  # designed for flow-sde without acceleration
@@ -167,6 +178,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.sample_actions = sample_actions_func
         self.logger = get_logger()
         self.global_step = 0
+        self._visual_adaptation_handles = install_visual_adaptation(
+            self,
+            self.paligemma_with_expert.paligemma.model,
+            self.config.visual_adaptation,
+        )
         # assert
         assert not (self.config.double_layer and self.config.joint_logprob), (
             "double_layer and joint_logprob can not be set at the same time"
@@ -1462,6 +1478,69 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     self.logger.info(
                         f"  Froze {noise_net_params:,} parameters in reinflow_explore_noise_net"
                     )
+
+    def align_visual_adaptation_dtype(self) -> None:
+        align_visual_adaptation_dtype(
+            self,
+            self.paligemma_with_expert.paligemma.model,
+        )
+
+    def configure_adaptation_trainability(self) -> None:
+        """Apply explicit expert/head/visual trainability switches.
+
+        This is a no-op for legacy configs. In explicit mode the PaliGemma
+        backbone is frozen, selected visual modules are re-enabled, and the
+        action expert and action projections follow their independent flags.
+        PPO value/noise heads remain trainable.
+        """
+
+        explicit_mode = (
+            self.config.train_action_expert is not None
+            or self.config.train_action_head is not None
+            or visual_adaptation_enabled(self.config.visual_adaptation)
+        )
+        if not explicit_mode:
+            return
+
+        train_action_expert = bool(self.config.train_action_expert)
+        train_action_head = bool(self.config.train_action_head)
+
+        for parameter in self.paligemma_with_expert.paligemma.parameters():
+            parameter.requires_grad = False
+        for parameter in self.paligemma_with_expert.gemma_expert.parameters():
+            parameter.requires_grad = train_action_expert
+
+        action_head_names = (
+            "action_in_proj",
+            "action_out_proj",
+            "state_proj",
+            "action_time_mlp_in",
+            "action_time_mlp_out",
+            "time_mlp_in",
+            "time_mlp_out",
+        )
+        for name in action_head_names:
+            module = getattr(self, name, None)
+            if module is not None:
+                for parameter in module.parameters():
+                    parameter.requires_grad = train_action_head
+
+        for parameter in iter_visual_adaptation_parameters(self):
+            parameter.requires_grad = True
+
+        trainable = sum(
+            parameter.numel()
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        )
+        total = sum(parameter.numel() for parameter in self.parameters())
+        self.logger.info(
+            "[VISUAL_ADAPTATION] "
+            f"train_action_expert={train_action_expert}, "
+            f"train_action_head={train_action_head}, "
+            f"trainable={trainable:,}/{total:,} "
+            f"({100.0 * trainable / total:.4f}%)"
+        )
 
     # ===== DSRL-specific methods =====
 

@@ -188,6 +188,14 @@ class EmbodiedRunner:
         resume_dir = self.cfg.runner.get("resume_dir", None)
         if resume_dir is None:
             return
+        checkpoint_mode = self.cfg.runner.get("checkpoint_mode", "full")
+        if checkpoint_mode == "trainable_only":
+            raise ValueError(
+                "runner.resume_dir requires a full checkpoint. A trainable-only "
+                "checkpoint can be loaded with "
+                "actor.model.trainable_checkpoint_path, but optimizer, scheduler, "
+                "and RNG state will be reinitialized."
+            )
 
         self.logger.info(f"Resuming training from checkpoint directory {resume_dir}.")
         self.global_step = parse_global_step_from_checkpoint_path(resume_dir)
@@ -664,7 +672,18 @@ class EmbodiedRunner:
         )
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
-        self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        checkpoint_mode = self.cfg.runner.get("checkpoint_mode", "full")
+        if checkpoint_mode == "full":
+            self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        elif checkpoint_mode == "trainable_only":
+            self.actor.save_trainable_checkpoint(
+                actor_save_path, self.global_step
+            ).wait()
+        else:
+            raise ValueError(
+                "runner.checkpoint_mode must be 'full' or 'trainable_only', "
+                f"got {checkpoint_mode!r}."
+            )
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1

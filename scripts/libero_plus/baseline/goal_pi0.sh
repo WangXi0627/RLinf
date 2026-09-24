@@ -116,12 +116,13 @@ echo "LIBERO_SUFFIX=${LIBERO_SUFFIX:-<unset>}"
 
 # ============================================================
 # objects_layout: 425 tasks = 25 envs × 17 epochs
-# sensor_noise: 379 tasks = 1 envs × 379 epochs
+# sensor_noise: 379 tasks = 25 envs × 16 epochs
 # ============================================================
 
 ray stop --force >/dev/null 2>&1 || true
 
-LOG_ROOT=/data/Xixixi/VLA1/RLinf/results/pi0/baseline/libero_plus \
+LOG_CATEGORY="${LIBERO_CATEGORY// /_}"
+LOG_ROOT=/data/Xixixi/VLA1/RLinf/results/pi0/baseline/libero_plus/${LOG_CATEGORY} \
 bash evaluations/run_eval.sh \
   libero \
   libero_goal_pi0_eval \

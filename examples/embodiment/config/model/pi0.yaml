@@ -2,6 +2,8 @@ model_type: "openpi"
 
 # Model path - should be set in specific config files
 model_path: "/path/to/model/openpi"
+# Optional trainable-only weights loaded on top of model_path.
+trainable_checkpoint_path: null
 
 precision: null
 
@@ -26,6 +28,28 @@ openpi:
   action_chunk: ${..num_action_chunks}
   num_steps: ${..num_steps}
   train_expert_only: True
+  # Explicit trainability switches. null preserves the legacy behavior.
+  train_action_expert: null
+  train_action_head: null
+
+  # FLA and last_layer_adapter are alternative visual backbone adapters.
+  # FTM is orthogonal and can be composed with either backbone choice.
+  visual_adaptation:
+    backbone:
+      type: none  # none | fla | last_layer_adapter
+      fla:
+        rank: 16
+        alpha: 16.0
+        dropout: 0.0
+        target_modules: [q_proj, k_proj, v_proj, out_proj]
+      last_layer_adapter:
+        bottleneck_dim: 64
+        dropout: 0.0
+        residual_scale: 1.0
+    ftm:
+      enabled: False
+      init_gamma: 0.0
+      init_beta: 0.0
   action_env_dim: ${..action_dim}
   noise_method: "flow_sde"
   add_value_head: ${..add_value_head}
