@@ -70,6 +70,36 @@ This extracts three uniformly selected query frames per successful episode at la
 
 Send the conversion, CPU, and GPU verification JSON files after these commands pass. Full Goal Sensor Noise collection, Camera evaluation, and strict initial-state/noise pairing are subsequent stages.
 
+## Process the Spatial, Object, and LIBERO-10 Sensor/Camera collections
+
+`3_process_full6.sh` processes the six complete vanilla collections stored under
+one `spatial_object_10_sensor_camera_<timestamp>` directory. It generates one
+canonical task mapping per suite, converts and verifies every pickle batch, and
+then merges Sensor Noise and Camera Viewpoints within each suite. The merge
+preserves distinct source IDs and uses hard links when the exports share a
+filesystem. It extracts one resumable layer-9/12/15 feature cache per merged
+suite and runs the normalized flow-matching forward check.
+
+The script uses explicit Python interpreters because mapping generation,
+trusted pickle deserialization, and GPU feature extraction require three
+different environments. Set `COLLECTION_SET` to select a particular run;
+otherwise the latest matching directory is used.
+
+```bash
+cd /data/Xixixi/VLA1/RLinf
+export COLLECTION_SET=/data/Xixixi/VLA1/RLinf/results/pi0/collection_batches/spatial_object_10_sensor_camera_<timestamp>
+export CUDA_VISIBLE_DEVICES=0
+export DEVICE=cuda:0
+bash scripts/libero_plus/collection/3_process_full6.sh
+```
+
+The final report is `pcd_full6_verification.json`. The three merged manifests
+and feature caches are under
+`pcd_merged/{spatial,object,10}_sensor_camera/`. These are two-category
+validation pools. Combining them with earlier Background, Light, and Objects
+Layout exports requires a new five-category manifest and therefore a new
+feature-cache directory.
+
 ## 中文说明
 
 这些脚本将已经完成的 vanilla π0 RLinf probe 转换为 PCD NPZ，并调用现有 PCD API 验证 manifest、冻结特征缓存和 query 训练输入。上面的命令按环境切换顺序给出：先在 PCD simulator 环境生成完整任务 mapping，再回到原 RLinf 环境转换 pickle，最后在 PCD OpenPI server 环境做 GPU 验证。
