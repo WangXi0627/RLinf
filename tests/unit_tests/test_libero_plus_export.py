@@ -14,6 +14,7 @@
 
 """The LIBERO-Plus exporter preserves executed control and query alignment."""
 
+import hashlib
 import json
 import os
 import pickle
@@ -30,6 +31,7 @@ from toolkits.libero_plus.convert_rollouts import (
     load_episode,
     prepare_image,
 )
+from toolkits.libero_plus.merge_exports import _verified_inventory
 
 
 def make_episode(cid=100, first_success=62, count=80):
@@ -180,6 +182,21 @@ def test_cpu_tensor_pickle(tmp_path):
         loaded, make_identity(), 100, CollectionContract("teacher")
     )
     assert meta["control_steps"] == 63
+
+
+def test_merge_inventory_requires_reported_unchanged_npz(tmp_path):
+    export = tmp_path / "export"
+    export.mkdir()
+    episode = export / "episode-a.npz"
+    episode.write_bytes(b"episode")
+    digest = hashlib.sha256(episode.read_bytes()).hexdigest()
+    (export / "conversion_report.json").write_text(
+        json.dumps({"episodes": [{"path": episode.name, "sha256": digest}]})
+    )
+    assert _verified_inventory(export) == [episode]
+    episode.write_bytes(b"modified")
+    with pytest.raises(ValueError, match="changed after conversion"):
+        _verified_inventory(export)
 
 
 @pytest.fixture
