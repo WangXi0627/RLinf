@@ -49,9 +49,14 @@ for suite in "${SUITES[@]}"; do
   tag="${SUITE_TAG[$suite]}"
   mapping="${MAPPING_ROOT}/${tag}_base_task_map.json"
   if [[ ! -s "${mapping}" ]]; then
-    "${SIM_PYTHON}" -m adapter_training.export_task_mapping_template \
-      --suite "${suite}" \
-      --output "${mapping}"
+    # The exporter resolves its default config/pcd prompt file relative to the
+    # current working directory, so run it from the PCD checkout explicitly.
+    (
+      cd "${PCD_ROOT}"
+      "${SIM_PYTHON}" -m adapter_training.export_task_mapping_template \
+        --suite "${suite}" \
+        --output "${mapping}"
+    )
   fi
 done
 
