@@ -100,6 +100,23 @@ validation pools. Combining them with earlier Background, Light, and Objects
 Layout exports requires a new five-category manifest and therefore a new
 feature-cache directory.
 
+## Archive the three complete five-category pools under PCD
+
+After `3_process_full6.sh` passes, combine its Sensor Noise and Camera exports
+with the existing Background, Light, and Objects Layout collections:
+
+```bash
+cd /data/Xixixi/VLA1/RLinf
+export COLLECTION_SET=/data/Xixixi/VLA1/RLinf/results/pi0/collection_batches/spatial_object_10_sensor_camera_<timestamp>
+bash scripts/libero_plus/collection/4_archive_full5_to_pcd.sh
+```
+
+The script creates Spatial, Object, and LIBERO-10 archives below the PCD v2
+`collect/` directory and their five-category manifests below `manifests/`.
+All episode files must be created as verified hardlinks; the command never
+moves or deletes source data. Existing complete outputs are verified and
+reused, while a partial output stops for manual review.
+
 ## 中文说明
 
 这些脚本将已经完成的 vanilla π0 RLinf probe 转换为 PCD NPZ，并调用现有 PCD API 验证 manifest、冻结特征缓存和 query 训练输入。上面的命令按环境切换顺序给出：先在 PCD simulator 环境生成完整任务 mapping，再回到原 RLinf 环境转换 pickle，最后在 PCD OpenPI server 环境做 GPU 验证。
