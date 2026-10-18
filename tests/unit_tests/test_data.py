@@ -727,6 +727,33 @@ def test_env_output_composes_one_transition_object():
     }
 
 
+def test_env_output_preserves_policy_routing_metadata():
+    obs = {
+        "states": torch.zeros(2, 3),
+        "task_descriptions": ["task zero", "task one"],
+        "meta_suite_names": ["libero_goal", "libero_goal"],
+        "meta_task_ids": torch.tensor([0, 1]),
+        "meta_task_names": ["query_0", "query_1"],
+        "meta_perturbation_categories": ["Background Textures"] * 2,
+        "meta_variant_ids": ["Background Textures:0", "Background Textures:1"],
+        "meta_classification_ids": torch.tensor([1, 2]),
+    }
+
+    prepared = EnvOutput(obs=obs).to_dict()["obs"]
+
+    assert prepared["meta_suite_names"] == obs["meta_suite_names"]
+    assert torch.equal(prepared["meta_task_ids"], obs["meta_task_ids"])
+    assert prepared["meta_task_names"] == obs["meta_task_names"]
+    assert (
+        prepared["meta_perturbation_categories"]
+        == obs["meta_perturbation_categories"]
+    )
+    assert prepared["meta_variant_ids"] == obs["meta_variant_ids"]
+    assert torch.equal(
+        prepared["meta_classification_ids"], obs["meta_classification_ids"]
+    )
+
+
 def test_removed_duplicate_types_are_not_schema_api():
     import rlinf.data.schema as schema
 
