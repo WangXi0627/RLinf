@@ -16,6 +16,7 @@ import math
 import random
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -84,6 +85,8 @@ class OpenPi0Config(Pi0Config):
     train_action_expert: bool | None = None
     train_action_head: bool | None = None
     visual_adaptation: dict[str, Any] = field(default_factory=dict)
+    # Frozen PCD Meta-Subspace adapter used only by native RLinf evaluation.
+    meta_subspace: dict[str, Any] = field(default_factory=dict)
     safe_get_logprob: bool = False
     joint_logprob: bool = False  # designed for flow-noise
     double_layer: bool = False  # designed for flow-sde without acceleration
@@ -183,6 +186,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             self.paligemma_with_expert.paligemma.model,
             self.config.visual_adaptation,
         )
+        # Installed after the frozen base checkpoint has been loaded.
+        self.meta_subspace_runtime = None
         # assert
         assert not (self.config.double_layer and self.config.joint_logprob), (
             "double_layer and joint_logprob can not be set at the same time"
@@ -861,6 +866,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         rtc_context: RTCGuidanceContext | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        meta_context = None
+        if self.meta_subspace_runtime is not None:
+            if mode != "eval":
+                raise RuntimeError("Meta-Subspace is an evaluation-only path in RLinf.")
+            device = next(self.parameters()).device
+            meta_context = self.meta_subspace_runtime.prepare_context(
+                env_obs, device=device
+            )
+
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(
             to_process_obs, transpose=False
@@ -887,6 +901,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 noise=noise_actions,
                 mode="eval",
                 compute_values=compute_values,
+                meta_context=meta_context,
             )
 
             # Step 3: Extract actual actions for environment interaction
@@ -911,10 +926,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     rtc_context=rtc_context,
                     mode=mode,
                     compute_values=compute_values,
+                    meta_context=meta_context,
                 )
             else:
                 outputs = self.sample_actions(
-                    observation, mode=mode, compute_values=compute_values
+                    observation,
+                    mode=mode,
+                    compute_values=compute_values,
+                    meta_context=meta_context,
                 )
             actions = self.output_transform(
                 {"actions": outputs["actions"], "state": observation.state}
@@ -967,6 +986,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="eval",
         compute_values=True,
+        meta_context=None,
     ) -> dict[str, torch.Tensor]:
         """Sample OpenPI actions with RTC overlap guidance enabled."""
         if self.config.rtc_guidance_mode != "approx":
@@ -980,6 +1000,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             noise=noise,
             mode=mode,
             compute_values=compute_values,
+            meta_context=meta_context,
         )
 
     @torch.no_grad()
@@ -989,6 +1010,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
+        meta_context=None,
     ) -> torch.Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
@@ -1005,7 +1027,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )
 
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            meta_context=meta_context,
         )
 
         return self._sample_actions_with_prefix_cache(
@@ -1269,7 +1295,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         v_t = self.action_out_proj(suffix_out)
         return v_t, suffix_out
 
-    def _build_prefix_cache(self, images, img_masks, lang_tokens, lang_masks):
+    def _build_prefix_cache(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        *,
+        meta_context=None,
+    ):
         """Embed prefix tokens and compute KV cache for efficient suffix generation."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks
@@ -1278,13 +1312,48 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+
+        runtime = self.meta_subspace_runtime
+        if runtime is not None and meta_context is not None:
+            language_tokens = 0 if lang_tokens is None else lang_tokens.shape[1]
+            image_tokens = prefix_embs.shape[1] - language_tokens
+            if image_tokens < 0 or image_tokens % len(img_masks) != 0:
+                raise ValueError(
+                    "Cannot infer per-view image-token count for Meta-Subspace"
+                )
+            tokens_per_view = image_tokens // len(img_masks)
+            image_token_mask = torch.cat(
+                [
+                    mask[:, None].expand(mask.shape[0], tokens_per_view)
+                    for mask in img_masks
+                ]
+                + [
+                    torch.zeros(
+                        (prefix_embs.shape[0], language_tokens),
+                        device=prefix_embs.device,
+                        dtype=torch.bool,
+                    )
+                ],
+                dim=1,
+            ).bool()
+            meta_context = {
+                **meta_context,
+                "image_token_mask": image_token_mask,
+            }
+
+        activation = (
+            runtime.activate(meta_context)
+            if runtime is not None and meta_context is not None
+            else nullcontext()
         )
+        with activation:
+            (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
         return prefix_output, prefix_pad_masks, past_key_values
 
     def _compute_value_from_suffix(self, suffix_out):

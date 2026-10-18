@@ -102,6 +102,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     from openpi.training import checkpoints as _checkpoints
 
     from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+    from rlinf.models.embodiment.openpi.meta_subspace import (
+        install_meta_subspace,
+    )
     from rlinf.models.embodiment.openpi.openpi_action_model import (
         OpenPi0Config,
         OpenPi0ForRLActionPrediction,
@@ -163,6 +166,24 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     trainable_checkpoint_path = getattr(cfg, "trainable_checkpoint_path", None)
     if trainable_checkpoint_path is not None:
         _load_trainable_checkpoint(model, str(trainable_checkpoint_path))
+
+    meta_runtime = install_meta_subspace(
+        model,
+        getattr(actor_model_config, "meta_subspace", None),
+        base_checkpoint_dir=checkpoint_dir,
+    )
+    if meta_runtime is not None:
+        message = (
+            "Loaded Meta-Subspace checkpoint "
+            f"{meta_runtime.checkpoint_path} at {meta_runtime.site}; "
+            f"support_size={meta_runtime.support_size}, "
+            f"support_seed={meta_runtime.support_seed}"
+        )
+        logger = getattr(model, "logger", None)
+        if logger is not None:
+            logger.info(message)
+        else:
+            print(message)
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     model.align_visual_adaptation_dtype()

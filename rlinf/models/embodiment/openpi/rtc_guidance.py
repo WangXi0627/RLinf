@@ -80,6 +80,7 @@ def sample_actions_with_rtc_guidance(
     noise: torch.Tensor | None = None,
     mode: str = "eval",
     compute_values: bool = True,
+    meta_context=None,
 ) -> dict[str, torch.Tensor]:
     """Real-world RTC sampler for OpenPI."""
 
@@ -98,7 +99,11 @@ def sample_actions_with_rtc_guidance(
         observation, train=False
     )
     prefix_output, prefix_pad_masks, past_key_values = model._build_prefix_cache(
-        images, img_masks, lang_tokens, lang_masks
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        meta_context=meta_context,
     )
 
     prev_remaining = (

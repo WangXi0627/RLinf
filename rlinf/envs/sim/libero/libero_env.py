@@ -1106,11 +1106,52 @@ class LiberoEnv(gym.Env):
 
         states = images_and_states["state"]
 
+        suite_name = str(self.cfg.task_suite_name).lower()
+        meta_task_names = []
+        meta_categories = []
+        meta_variant_ids = []
+        meta_classification_ids = []
+        for env_index, task_id in enumerate(self.task_ids):
+            entry = None
+            if self._plus_manifest_entries is not None:
+                entry = self._plus_manifest_entries[env_index]
+            task = self.task_suite.get_task(int(task_id))
+            task_name = str(getattr(task, "name", "")).strip()
+            if not task_name:
+                task_name = os.path.splitext(
+                    os.path.basename(task.bddl_file)
+                )[0]
+            if entry is not None:
+                task_name = str(entry["name"])
+                category = str(entry["category"])
+                variant_id = str(entry["classification_id"])
+                classification_id = int(entry["classification_id"])
+            else:
+                category = str(self.plus_category or "")
+                variant_id = task_name
+                classification_id = -1
+            meta_task_names.append(task_name)
+            meta_categories.append(category)
+            meta_variant_ids.append(variant_id)
+            meta_classification_ids.append(classification_id)
+
         obs = {
             "main_images": full_image_tensor,
             "wrist_images": wrist_image_tensor,
             "states": states,
             "task_descriptions": self.task_descriptions,
+            # Metadata stays outside OpenPI transforms and is consumed only by
+            # the native Meta-Subspace task-code router.
+            "meta_suite_names": [suite_name] * len(self.task_ids),
+            "meta_task_ids": torch.as_tensor(
+                self.task_ids.copy(), dtype=torch.long
+            ),
+            "meta_task_names": meta_task_names,
+            "meta_perturbation_categories": meta_categories,
+            "meta_variant_ids": meta_variant_ids,
+            "meta_classification_ids": torch.as_tensor(
+                meta_classification_ids, dtype=torch.long
+            ),
         }
         return obs
 

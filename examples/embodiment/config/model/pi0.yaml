@@ -50,6 +50,23 @@ openpi:
       enabled: False
       init_gamma: 0.0
       init_beta: 0.0
+
+  # Evaluation-only PCD Meta-Subspace overlay. The frozen Pi0 checkpoint is
+  # loaded first; this checkpoint contributes only TaskEncoder/Demix/FiLM/Mask.
+  meta_subspace:
+    enabled: False
+    checkpoint_path: null
+    manifest_path: null
+    feature_dir: null
+    task_mapping_path: null
+    base_config: "pi0_libero"
+    support_size: 2
+    support_seed: 7
+    intervention_alpha: 0.25
+    component_mode: "full"
+    strict: True
+    verify_artifact_hashes: True
+    verify_base_identity: True
   action_env_dim: ${..action_dim}
   noise_method: "flow_sde"
   add_value_head: ${..add_value_head}

@@ -17,9 +17,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib.util
+import json
 import sys
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -39,6 +42,17 @@ from rlinf.models.embodiment.modules.rlt_token_transformer import (
 from rlinf.models.embodiment.openpi.apxinf_adapter import (
     OpenPIApxInfAdapter,
     _active_token_ids,
+)
+from rlinf.models.embodiment.openpi.meta_subspace import (
+    DemixMaskConfig,
+    DemixMaskIntervention,
+    MetaSubspaceRuntime,
+    SupportConditionedDemixMask,
+    SupportTaskEncoderConfig,
+)
+from rlinf.models.embodiment.openpi.rtc_guidance import (
+    RTCGuidanceContext,
+    sample_actions_with_rtc_guidance,
 )
 from rlinf.scheduler import Worker
 from rlinf.utils.env_helpers import HistoryManager
@@ -1271,4 +1285,264 @@ def test_apxinf_a_missing_apxinf_robo_names_what_to_install(monkeypatch):
     with pytest.raises(ImportError, match="apxinf_robo"):
         OpenPIApxInfAdapter(
             _apxinf_model_cfg(), "cpu", processor=_FakeApxInfProcessor()
+        )
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_meta_subspace_intervention_bypasses_unsupported_batch_items():
+    config = DemixMaskConfig(
+        site="pre_joint_layer_15",
+        hidden_dim=8,
+        rank=2,
+        task_code_dim=4,
+        conditioner_hidden_dim=3,
+    )
+    intervention = DemixMaskIntervention(config)
+    intervention.configure(alpha=1.0, component_mode="full")
+    with torch.no_grad():
+        intervention.mask[-1].bias.fill_(1.0)
+
+    hidden = torch.randn(2, 5, 8)
+    output = intervention(
+        hidden,
+        task_code=torch.randn(2, 4),
+        image_token_mask=torch.ones(2, 5, dtype=torch.bool),
+        sample_mask=torch.tensor([True, False]),
+    )
+
+    assert not torch.equal(output[0], hidden[0])
+    torch.testing.assert_close(output[1], hidden[1], rtol=0, atol=0)
+
+
+def _write_meta_subspace_runtime_package(tmp_path: Path) -> dict[str, str]:
+    mapping_path = tmp_path / "task_mapping.json"
+    mapping = {
+        "schema_version": 1,
+        "tasks": [
+            {
+                "suite": "libero_goal",
+                "task_id": task_id,
+                "task_name": f"query_{task_id}",
+                "base_task_id": f"base_{task_id}",
+                "perturbation_category": "Query",
+                "variant_id": f"query:{task_id}",
+            }
+            for task_id in range(2)
+        ],
+    }
+    mapping_path.write_text(json.dumps(mapping), encoding="utf-8")
+
+    feature_dir = tmp_path / "features"
+    feature_dir.mkdir()
+    rows = []
+    shards = {}
+    episode_index = 0
+    for base_task in ("base_0", "base_1"):
+        for category, offset in (("SupportA", 0.0), ("SupportB", 1.0)):
+            episode_sha = f"{episode_index:064x}"
+            path = f"{base_task}/{category}/episode-{episode_index}.npz"
+            rows.append(
+                {
+                    "path": path,
+                    "sha256": episode_sha,
+                    "split": "train",
+                    "metadata": {
+                        "success": True,
+                        "base_task_id": base_task,
+                        "perturbation_category": category,
+                    },
+                }
+            )
+            shard_path = feature_dir / f"{episode_sha}.npz"
+            base_index = int(base_task[-1])
+            feature_value = np.arange(6, dtype=np.float32) ** (base_index + 1) + offset
+            np.savez(
+                shard_path,
+                episode_sha256=np.asarray(episode_sha),
+                pre_joint_layer_15=np.stack([feature_value, feature_value + 0.5]),
+            )
+            shards[episode_sha] = _sha256(shard_path)
+            episode_index += 1
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest = {
+        "schema_version": 1,
+        "kind": "libero-plus-meta-subspace-pool",
+        "mapping_sha256": _sha256(mapping_path),
+        "episodes": rows,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    feature_index_path = feature_dir / "index.json"
+    feature_index = {
+        "schema_version": 1,
+        "kind": "libero-plus-mid-vlm-features",
+        "manifest_sha256": _sha256(manifest_path),
+        "sites": ["pre_joint_layer_15"],
+        "feature_dim": 6,
+        "shards": shards,
+    }
+    feature_index_path.write_text(json.dumps(feature_index), encoding="utf-8")
+
+    torch.manual_seed(7)
+    encoder_config = SupportTaskEncoderConfig(
+        feature_dim=6, hidden_dim=5, task_code_dim=4
+    )
+    intervention_config = DemixMaskConfig(
+        site="pre_joint_layer_15",
+        hidden_dim=8,
+        rank=2,
+        task_code_dim=4,
+        conditioner_hidden_dim=3,
+    )
+    adapter = SupportConditionedDemixMask(encoder_config, intervention_config)
+    checkpoint_path = tmp_path / "meta.pt"
+    torch.save(
+        {
+            "schema_version": 1,
+            "method": "libero-plus-support-conditioned-demix-mask",
+            "config": {"support_size": 2},
+            "adapter_config": {
+                "encoder": asdict(encoder_config),
+                "intervention": asdict(intervention_config),
+            },
+            "adapter": adapter.state_dict(),
+            "base_identity": {"base_config": "pi0_libero"},
+            "metadata": {
+                "manifest_sha256": _sha256(manifest_path),
+                "feature_index_sha256": _sha256(feature_index_path),
+            },
+        },
+        checkpoint_path,
+    )
+    return {
+        "checkpoint_path": str(checkpoint_path),
+        "manifest_path": str(manifest_path),
+        "feature_dir": str(feature_dir),
+        "task_mapping_path": str(mapping_path),
+    }
+
+
+def test_meta_subspace_routes_a_distinct_code_to_each_environment(tmp_path):
+    config = {
+        "enabled": True,
+        **_write_meta_subspace_runtime_package(tmp_path),
+        "support_size": 2,
+        "support_seed": 7,
+        "intervention_alpha": 0.25,
+        "component_mode": "full",
+        "strict": True,
+        "verify_artifact_hashes": True,
+        "verify_base_identity": False,
+    }
+    runtime = MetaSubspaceRuntime(config)
+    context = runtime.prepare_context(
+        {
+            "meta_suite_names": ["libero_goal", "libero_goal"],
+            "meta_task_ids": torch.tensor([0, 1]),
+            "meta_task_names": ["query_0", "query_1"],
+            "meta_perturbation_categories": ["Query", "Query"],
+        },
+        device=torch.device("cpu"),
+    )
+
+    assert context["task_code"].shape == (2, 4)
+    assert context["sample_mask"].tolist() == [True, True]
+    assert not torch.equal(context["task_code"][0], context["task_code"][1])
+
+    reversed_context = runtime.prepare_context(
+        {
+            "meta_suite_names": ["libero_goal", "libero_goal"],
+            "meta_task_ids": torch.tensor([1, 0]),
+            "meta_task_names": ["query_1", "query_0"],
+            "meta_perturbation_categories": ["Query", "Query"],
+        },
+        device=torch.device("cpu"),
+    )
+    torch.testing.assert_close(
+        reversed_context["task_code"],
+        context["task_code"].flip(0),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_meta_subspace_can_fall_back_per_sample_when_not_strict(tmp_path):
+    config = {
+        "enabled": True,
+        **_write_meta_subspace_runtime_package(tmp_path),
+        "strict": False,
+        "verify_base_identity": False,
+    }
+    runtime = MetaSubspaceRuntime(config)
+    context = runtime.prepare_context(
+        {
+            "meta_suite_names": ["libero_goal", "libero_goal"],
+            "meta_task_ids": torch.tensor([0, 99]),
+            "meta_task_names": ["query_0", "unknown"],
+            "meta_perturbation_categories": ["Query", "Query"],
+        },
+        device=torch.device("cpu"),
+    )
+
+    assert context["sample_mask"].tolist() == [True, False]
+    torch.testing.assert_close(
+        context["task_code"][1],
+        torch.zeros(4),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_meta_subspace_strict_mode_rejects_missing_supports(tmp_path):
+    config = {
+        "enabled": True,
+        **_write_meta_subspace_runtime_package(tmp_path),
+        "support_size": 3,
+        "strict": True,
+        "verify_base_identity": False,
+    }
+    runtime = MetaSubspaceRuntime(config)
+
+    with pytest.raises(ValueError, match="No eligible cross-category"):
+        runtime.prepare_context(
+            {
+                "meta_suite_names": ["libero_goal"],
+                "meta_task_ids": torch.tensor([0]),
+                "meta_task_names": ["query_0"],
+                "meta_perturbation_categories": ["Query"],
+            },
+            device=torch.device("cpu"),
+        )
+
+
+def test_rtc_forwards_meta_context_to_prefix_cache():
+    marker = {"task_code": torch.ones(1, 4)}
+
+    class _StopAfterPrefixCheck(RuntimeError):
+        pass
+
+    class _RTCModel:
+        config = SimpleNamespace(num_steps=10)
+
+        def _preprocess_observation(self, observation, train):
+            assert train is False
+            return "images", "image_masks", "tokens", "token_masks", "state"
+
+        def _build_prefix_cache(self, *args, meta_context=None):
+            assert args == ("images", "image_masks", "tokens", "token_masks")
+            assert meta_context is marker
+            raise _StopAfterPrefixCheck
+
+    observation = SimpleNamespace(state=torch.zeros(1, 8))
+    with pytest.raises(_StopAfterPrefixCheck):
+        sample_actions_with_rtc_guidance(
+            _RTCModel(),
+            observation,
+            RTCGuidanceContext(),
+            noise=torch.zeros(1, 50, 32),
+            meta_context=marker,
         )
