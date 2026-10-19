@@ -254,6 +254,12 @@ def install_visual_adaptation(
                 "FLA was enabled, but none of target_modules matched a vision "
                 f"nn.Linear. Requested targets: {sorted(targets)}"
             )
+        expected_modules = _get(fla, "expected_modules", None)
+        if expected_modules is not None and len(names) != int(expected_modules):
+            raise ValueError(
+                "FLA module count mismatch: "
+                f"expected {int(expected_modules)}, replaced {len(names)}"
+            )
         owner._fla_module_names = tuple(names)
 
     if backbone_type == "last_layer_adapter":
@@ -326,3 +332,4 @@ def align_visual_adaptation_dtype(
                 device=projector_linear.weight.device,
                 dtype=projector_linear.weight.dtype,
             )
+

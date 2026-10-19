@@ -20,6 +20,85 @@ import torch
 from omegaconf import DictConfig
 
 
+_PCD_SPATIAL_ADAPTATION_METHOD = "libero_spatial_adaptation_ftm_fla_v1"
+_RLINF_VISION_LAYER_PREFIX = (
+    "paligemma_with_expert.paligemma.model."
+    "vision_tower.vision_model.encoder."
+)
+
+
+def _pcd_spatial_adaptation_state(
+    model: torch.nn.Module, payload: dict
+) -> dict[str, torch.Tensor]:
+    """Translate a native PCD FTM/FLA checkpoint into RLinf model keys."""
+
+    adaptation = payload.get("adaptation")
+    state = payload.get("adaptation_state")
+    if not isinstance(adaptation, dict) or not isinstance(state, dict) or not state:
+        raise ValueError("Malformed native PCD spatial-adaptation checkpoint")
+    method = adaptation.get("method")
+    spec = adaptation.get("spec", {})
+
+    if method == "ftm":
+        if set(state) != {"gamma", "beta"}:
+            raise ValueError(
+                "Native PCD FTM checkpoint must contain exactly gamma and beta"
+            )
+        if spec.get("view_indices") != [0, 1]:
+            raise ValueError(
+                "RLinf native FTM loading currently requires view_indices=[0, 1]"
+            )
+        if getattr(model, "visual_ftm", None) is None:
+            raise RuntimeError(
+                "The checkpoint is FTM, but visual_adaptation.ftm.enabled is false"
+            )
+        return {
+            "visual_ftm.gamma": state["gamma"],
+            "visual_ftm.beta": state["beta"],
+        }
+
+    if method == "fla":
+        from rlinf.models.embodiment.openpi.visual_adaptation import FLALinear
+
+        rank = int(spec.get("rank", -1))
+        scale = float(spec.get("scale", float("nan")))
+        expected_modules = int(spec.get("expected_layers", 0)) * 2
+        modules = [
+            module for module in model.modules() if isinstance(module, FLALinear)
+        ]
+        if len(modules) != expected_modules:
+            raise RuntimeError(
+                "Native PCD FLA/runtime module count mismatch: "
+                f"checkpoint expects {expected_modules}, runtime has {len(modules)}"
+            )
+        if any(module.rank != rank for module in modules):
+            raise RuntimeError(
+                f"Native PCD FLA rank={rank} does not match the RLinf configuration"
+            )
+        if any(abs(float(module.scaling) - scale) > 1e-12 for module in modules):
+            raise RuntimeError(
+                f"Native PCD FLA scale={scale} does not match alpha/rank in RLinf"
+            )
+
+        translated = {}
+        for name, value in state.items():
+            if name.endswith(".lora_a"):
+                suffix = name[: -len(".lora_a")] + ".lora_A.weight"
+            elif name.endswith(".lora_b"):
+                suffix = name[: -len(".lora_b")] + ".lora_B.weight"
+            else:
+                raise ValueError(f"Unknown native PCD FLA tensor: {name}")
+            translated[_RLINF_VISION_LAYER_PREFIX + suffix] = value
+        if len(translated) != expected_modules * 2:
+            raise ValueError(
+                "Native PCD FLA tensor count mismatch: "
+                f"expected {expected_modules * 2}, got {len(translated)}"
+            )
+        return translated
+
+    raise ValueError(f"Unsupported native PCD spatial-adaptation method: {method!r}")
+
+
 def _resolve_trainable_checkpoint(path: str | os.PathLike[str]) -> pathlib.Path:
     requested_path = pathlib.Path(path).expanduser()
     candidates = [
@@ -53,7 +132,10 @@ def _load_trainable_checkpoint(model: torch.nn.Module, path: str) -> pathlib.Pat
         raise TypeError(
             f"Trainable checkpoint must be a dictionary, got {type(payload)!r}."
         )
-    state_dict = payload.get("state_dict", payload)
+    if payload.get("method") == _PCD_SPATIAL_ADAPTATION_METHOD:
+        state_dict = _pcd_spatial_adaptation_state(model, payload)
+    else:
+        state_dict = payload.get("state_dict", payload)
     if not isinstance(state_dict, dict) or not state_dict:
         raise ValueError(
             f"No state_dict tensors found in trainable checkpoint {checkpoint_path}."
@@ -235,3 +317,4 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     )
 
     return model
+
