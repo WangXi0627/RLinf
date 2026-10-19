@@ -36,6 +36,7 @@ SITE_TO_LAYER_INDEX = {
     "pre_joint_layer_15": 14,
 }
 COMPONENT_MODES = ("full", "demix_only", "mask_only")
+ACTION_MODES = ("all_meta", "meta_action6_base_gripper")
 
 
 def _sha256(path: str | Path) -> str:
@@ -274,6 +275,12 @@ class MetaSubspaceRuntime(nn.Module):
         super().__init__()
         self.runtime_config = dict(config)
         self.enabled = bool(self.runtime_config.get("enabled", False))
+        self.action_mode = str(self.runtime_config.get("action_mode", "all_meta"))
+        if self.action_mode not in ACTION_MODES:
+            raise ValueError(
+                f"meta_subspace.action_mode must be one of {ACTION_MODES}, "
+                f"got {self.action_mode!r}"
+            )
         self._hook_handle = None
         self._active_context: dict[str, torch.Tensor] | None = None
         self._codes: dict[tuple[str, str], torch.Tensor | None] = {}
@@ -380,6 +387,32 @@ class MetaSubspaceRuntime(nn.Module):
 
         if bool(self.runtime_config.get("verify_base_identity", True)):
             self._verify_base_identity(base_checkpoint_dir)
+
+    @property
+    def uses_base_gripper(self) -> bool:
+        """Whether evaluation keeps the base policy's seventh action dimension."""
+        return self.action_mode == "meta_action6_base_gripper"
+
+    def combine_actions(
+        self,
+        meta_actions: torch.Tensor,
+        base_actions: torch.Tensor,
+    ) -> torch.Tensor:
+        """Combine model-space actions according to the evaluation protocol."""
+        if not self.uses_base_gripper:
+            return meta_actions
+        if meta_actions.shape != base_actions.shape:
+            raise ValueError("Meta and base action chunks must have equal shapes")
+        if meta_actions.ndim < 1 or meta_actions.shape[-1] < 7:
+            raise ValueError(
+                "Base-gripper mixing requires at least seven action dimensions"
+            )
+        if meta_actions.device != base_actions.device:
+            raise ValueError("Meta and base action chunks must be on the same device")
+
+        combined = meta_actions.clone()
+        combined[..., 6] = base_actions[..., 6].to(dtype=combined.dtype)
+        return combined
 
     def _required(self, key: str) -> str:
         value = self.runtime_config.get(key)
@@ -620,6 +653,7 @@ class MetaSubspaceRuntime(nn.Module):
             "site": getattr(self, "site", ""),
             "support_size": getattr(self, "support_size", 0),
             "support_seed": getattr(self, "support_seed", 0),
+            "action_mode": self.action_mode,
             "cached_task_codes": len(self._codes),
             "task_codes": list(self._code_details.values()),
         }

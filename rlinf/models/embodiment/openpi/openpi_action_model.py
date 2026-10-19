@@ -885,6 +885,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         observation = _model.Observation.from_dict(processed_obs)
 
         is_dsrl_active = self.config.use_dsrl
+        if (
+            is_dsrl_active
+            and meta_context is not None
+            and self.meta_subspace_runtime is not None
+            and self.meta_subspace_runtime.uses_base_gripper
+        ):
+            raise RuntimeError(
+                "Meta-Subspace base-gripper evaluation is not supported with DSRL"
+            )
         if is_dsrl_active:
             # DSRL mode (both train and eval)
 
@@ -917,6 +926,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         else:
             # Non-DSRL or eval mode
+            shared_noise = None
+            use_base_gripper = (
+                meta_context is not None
+                and self.meta_subspace_runtime is not None
+                and self.meta_subspace_runtime.uses_base_gripper
+            )
+            if use_base_gripper:
+                shared_noise = self.sample_noise(
+                    (
+                        observation.state.shape[0],
+                        self.config.action_horizon,
+                        self.config.action_dim,
+                    ),
+                    observation.state.device,
+                )
             if rtc_context is not None and mode == "eval" and self.config.rtc_enabled:
                 # RTC is only used during evaluation: the rollout worker passes
                 # the previous model-space action chunk so the sampler can guide
@@ -924,6 +948,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 outputs = self.sample_actions_with_rtc_guidance(
                     observation,
                     rtc_context=rtc_context,
+                    noise=shared_noise,
                     mode=mode,
                     compute_values=compute_values,
                     meta_context=meta_context,
@@ -931,9 +956,31 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             else:
                 outputs = self.sample_actions(
                     observation,
+                    noise=shared_noise,
                     mode=mode,
                     compute_values=compute_values,
                     meta_context=meta_context,
+                )
+            if use_base_gripper:
+                if rtc_context is not None and self.config.rtc_enabled:
+                    base_outputs = self.sample_actions_with_rtc_guidance(
+                        observation,
+                        rtc_context=rtc_context,
+                        noise=shared_noise,
+                        mode=mode,
+                        compute_values=False,
+                        meta_context=None,
+                    )
+                else:
+                    base_outputs = self.sample_actions(
+                        observation,
+                        noise=shared_noise,
+                        mode=mode,
+                        compute_values=False,
+                        meta_context=None,
+                    )
+                outputs["actions"] = self.meta_subspace_runtime.combine_actions(
+                    outputs["actions"], base_outputs["actions"]
                 )
             actions = self.output_transform(
                 {"actions": outputs["actions"], "state": observation.state}

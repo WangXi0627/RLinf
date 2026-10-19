@@ -82,6 +82,7 @@ rollout:
         support_seed: 7
         intervention_alpha: 0.25
         component_mode: "full"
+        action_mode: "all_meta"
         strict: True
         verify_artifact_hashes: True
         verify_base_identity: True

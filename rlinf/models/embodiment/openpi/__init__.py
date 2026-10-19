@@ -177,7 +177,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             "Loaded Meta-Subspace checkpoint "
             f"{meta_runtime.checkpoint_path} at {meta_runtime.site}; "
             f"support_size={meta_runtime.support_size}, "
-            f"support_seed={meta_runtime.support_seed}"
+            f"support_seed={meta_runtime.support_seed}, "
+            f"action_mode={meta_runtime.action_mode}"
         )
         logger = getattr(model, "logger", None)
         if logger is not None:

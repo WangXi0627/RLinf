@@ -39,9 +39,13 @@ from rlinf.models import get_model, register_model
 from rlinf.models.embodiment.modules.rlt_token_transformer import (
     RLTTokenTransformer,
 )
+from rlinf.models.embodiment.openpi import openpi_action_model
 from rlinf.models.embodiment.openpi.apxinf_adapter import (
     OpenPIApxInfAdapter,
     _active_token_ids,
+)
+from rlinf.models.embodiment.openpi.openpi_action_model import (
+    OpenPi0ForRLActionPrediction,
 )
 from rlinf.models.embodiment.openpi.meta_subspace import (
     DemixMaskConfig,
@@ -1468,6 +1472,109 @@ def test_meta_subspace_routes_a_distinct_code_to_each_environment(tmp_path):
         rtol=0,
         atol=0,
     )
+
+
+def test_meta_subspace_action6_uses_base_gripper_only(tmp_path):
+    runtime = MetaSubspaceRuntime(
+        {
+            "enabled": True,
+            **_write_meta_subspace_runtime_package(tmp_path),
+            "action_mode": "meta_action6_base_gripper",
+            "verify_base_identity": False,
+        }
+    )
+    meta_actions = torch.arange(2 * 3 * 8, dtype=torch.float32).reshape(2, 3, 8)
+    base_actions = -meta_actions - 1
+
+    combined = runtime.combine_actions(meta_actions, base_actions)
+
+    torch.testing.assert_close(combined[..., :6], meta_actions[..., :6])
+    torch.testing.assert_close(combined[..., 6], base_actions[..., 6])
+    torch.testing.assert_close(combined[..., 7:], meta_actions[..., 7:])
+    torch.testing.assert_close(
+        meta_actions,
+        torch.arange(48, dtype=torch.float32).reshape(2, 3, 8),
+    )
+
+
+def test_meta_subspace_action6_samples_meta_and_base_with_shared_noise(monkeypatch):
+    meta_context = {"task_code": torch.ones(2, 4)}
+    calls = []
+    shared_noise = torch.full((2, 3, 8), 7.0)
+
+    def sample_actions(
+        observation,
+        *,
+        noise,
+        mode,
+        compute_values,
+        meta_context,
+    ):
+        del observation, mode, compute_values
+        calls.append((noise, meta_context))
+        value = 10.0 if meta_context is not None else -10.0
+        actions = torch.full((2, 3, 8), value)
+        return {
+            "actions": actions,
+            "chains": torch.zeros(2, 1, 3, 8),
+            "denoise_inds": torch.zeros(2, 1, dtype=torch.long),
+            "prev_logprobs": torch.zeros(2, 3, 7),
+            "prev_values": torch.zeros(2, 1),
+        }
+
+    runtime = SimpleNamespace(
+        uses_base_gripper=True,
+        prepare_context=lambda env_obs, device: meta_context,
+        combine_actions=lambda meta, base: torch.cat(
+            (meta[..., :6], base[..., 6:7], meta[..., 7:]), dim=-1
+        ),
+    )
+    fake_model = SimpleNamespace(
+        meta_subspace_runtime=runtime,
+        parameters=lambda: iter([torch.nn.Parameter(torch.zeros(()))]),
+        obs_processor=lambda env_obs: {
+            "tokenized_prompt": torch.zeros(2, 1, dtype=torch.long),
+            "tokenized_prompt_mask": torch.ones(2, 1, dtype=torch.bool),
+        },
+        input_transform=lambda obs, transpose: obs,
+        precision_processor=lambda obs: obs,
+        config=SimpleNamespace(
+            use_dsrl=False,
+            rtc_enabled=False,
+            action_horizon=3,
+            action_dim=8,
+            is_nft=False,
+        ),
+        sample_noise=lambda shape, device: shared_noise,
+        sample_actions=sample_actions,
+        output_transform=lambda data: {"actions": data["actions"][..., :7]},
+    )
+    observation = SimpleNamespace(state=torch.zeros(2, 8))
+    monkeypatch.setattr(
+        openpi_action_model._model.Observation,
+        "from_dict",
+        staticmethod(lambda data: observation),
+    )
+
+    actions, result = OpenPi0ForRLActionPrediction.predict_action_batch(
+        fake_model, {}, mode="eval", compute_values=False
+    )
+
+    assert len(calls) == 2
+    assert calls[0][0] is shared_noise
+    assert calls[0][1] is meta_context
+    assert calls[1][0] is shared_noise
+    assert calls[1][1] is None
+    torch.testing.assert_close(actions[..., :6], torch.full((2, 3, 6), 10.0))
+    torch.testing.assert_close(actions[..., 6], torch.full((2, 3), -10.0))
+    torch.testing.assert_close(
+        result["model_actions"][..., 7], torch.full((2, 3), 10.0)
+    )
+
+
+def test_meta_subspace_rejects_unknown_action_mode():
+    with pytest.raises(ValueError, match="meta_subspace.action_mode"):
+        MetaSubspaceRuntime({"enabled": False, "action_mode": "unknown"})
 
 
 def test_meta_subspace_can_fall_back_per_sample_when_not_strict(tmp_path):

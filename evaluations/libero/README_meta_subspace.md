@@ -9,6 +9,7 @@ The evaluation config uses 25 environments in parallel, replans every five
 actions (`num_action_chunks: 5`), waits 10 simulator steps after reset, and
 uses seed 7. The behavior-preserve smoke-test settings are support size 2,
 support seed 7, intervention alpha 0.25, and the component mode `full`.
+By default, all seven LIBERO action dimensions come from Meta-Subspace.
 
 ## Required artifacts
 
@@ -43,6 +44,20 @@ export LIBERO_CLASSIFICATION_PATH=/absolute/path/to/task_classification.json
 bash evaluations/run_eval.sh \
   libero libero_goal_pi0_meta_subspace_eval
 ```
+
+To evaluate the six arm dimensions from Meta-Subspace while retaining the
+base Pi0 gripper command, use:
+
+```bash
+bash evaluations/run_eval.sh \
+  libero libero_goal_pi0_meta_subspace_eval \
+  rollout.model.openpi.meta_subspace.action_mode=meta_action6_base_gripper
+```
+
+This mode runs Meta-Subspace and base Pi0 with the same initial flow noise,
+combines their model-space action chunks before LIBERO output transforms, and
+therefore adds one base-policy forward pass per replanning step. Use
+`action_mode=all_meta` for the original seven-dimensional Meta-Subspace action.
 
 Set `LIBERO_CATEGORY` to the exact category name in the classification JSON.
 To change parallelism without editing the checked-in config, append a Hydra
