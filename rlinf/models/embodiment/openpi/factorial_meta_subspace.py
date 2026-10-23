@@ -20,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from openpi.models import model as _model
+from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
 from torch import nn
 from torch.utils._pytree import tree_map
 
@@ -197,6 +198,17 @@ class SupportConditionedResidualMask(nn.Module):
 
     def encode_support(self, features: torch.Tensor) -> torch.Tensor:
         return self.task_encoder(features)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        site: str,
+        context: Mapping[str, Any] | None = None,
+    ) -> torch.Tensor:
+        if site != self.intervention.config.site:
+            return hidden_states
+        return self.intervention(hidden_states, **dict(context or {}))
 
 
 @dataclass(frozen=True)
@@ -506,15 +518,48 @@ class FactorialMetaSubspaceRuntime(nn.Module):
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1.0 - time_expanded) * actions
         target = noise - actions
+        prefix_embs, prefix_pad_masks, prefix_att_masks, image_token_mask = (
+            self.model.embed_prefix(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                adapter_enabled=False,
+                return_image_token_mask=True,
+            )
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+            self.model.embed_suffix(state, x_t, time)
+        )
+        backbone_dtype = self.model.paligemma_with_expert.paligemma.language_model.layers[
+            0
+        ].self_attn.q_proj.weight.dtype
+        prefix_embs = prefix_embs.to(dtype=backbone_dtype)
+        suffix_embs = suffix_embs.to(dtype=backbone_dtype)
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        attention = self.model._prepare_attention_masks_4d(
+            make_att_2d_masks(pad_masks, att_masks)
+        )
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
         context = {
+            "image_token_mask": image_token_mask,
             "task_code": code.expand(len(raw_rows), -1),
             "mask_logits": logits.expand(len(raw_rows), -1),
             "strength": 1.0,
         }
-        _, prefix_pad_masks, past_key_values = self.model._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks, meta_context=context
+        (_, suffix_out), _ = self.model.paligemma_with_expert.forward(
+            attention_mask=attention,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+            feature_intervention=self.adapter,
+            intervention_context=context,
         )
-        predicted, _ = self.model.get_velocity(state, x_t, time, prefix_pad_masks, past_key_values)
+        suffix_out = suffix_out[:, -self.model.config.action_horizon :].float()
+        predicted = self.model.action_out_proj(suffix_out)
         return (
             predicted[:, : self.flow_prefix_steps, :7].float()
             - target[:, : self.flow_prefix_steps, :7].float()
