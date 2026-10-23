@@ -54,6 +54,7 @@ from pathlib import Path
 
 import torch
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+from openpi.training import checkpoints as openpi_checkpoints
 
 arm = sys.argv[1]
 checkpoint = Path(os.environ["FACTORIAL_CHECKPOINT"]).resolve()
@@ -68,6 +69,7 @@ def sha(path):
             digest.update(chunk)
     return digest.hexdigest()
 
+assert callable(openpi_checkpoints.load_norm_stats)
 assert "intervention_context" in inspect.signature(PI0Pytorch.flow_velocity).parameters, (
     "Pull feature/liberoplus-task-residual-mask-bilevel-v1 in OPENPI_ROOT"
 )
