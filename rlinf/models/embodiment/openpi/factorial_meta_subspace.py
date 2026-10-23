@@ -11,6 +11,7 @@ import copy
 import hashlib
 import json
 import math
+import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -235,7 +236,7 @@ class FactorialMetaSubspaceRuntime(nn.Module):
         self._hook_handle = None
         self._states: dict[tuple[str, str], dict[str, torch.Tensor] | None] = {}
         self._state_details: dict[tuple[str, str], dict[str, Any]] = {}
-        self.model = None
+        self._model_ref: weakref.ReferenceType[nn.Module] | None = None
         if not self.enabled:
             self.adapter = None
             return
@@ -376,8 +377,23 @@ class FactorialMetaSubspaceRuntime(nn.Module):
             if not path.is_file() or _sha256(path) != expected:
                 raise ValueError(f"Factorial checkpoint/base normalization mismatch: {relative}")
 
+    @property
+    def model(self) -> nn.Module:
+        if self._model_ref is None:
+            raise RuntimeError("Factorial runtime is not installed on a model")
+        model = self._model_ref()
+        if model is None:
+            raise RuntimeError("Factorial runtime model has been released")
+        return model
+
+    def _bind_model(self, model: nn.Module) -> None:
+        # The runtime is already registered below the policy model. Keeping the
+        # policy as a normal nn.Module attribute here would create the cycle
+        # policy -> runtime -> policy and recurse forever in model.to/state_dict.
+        self._model_ref = weakref.ref(model)
+
     def install(self, model: nn.Module) -> None:
-        self.model = model
+        self._bind_model(model)
         layers = model.paligemma_with_expert.paligemma.language_model.layers
         if self.layer_index >= len(layers):
             raise ValueError(f"Cannot install factorial hook at {self.site}")
