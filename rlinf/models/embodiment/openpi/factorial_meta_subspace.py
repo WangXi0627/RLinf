@@ -272,6 +272,7 @@ class FactorialMetaSubspaceRuntime(nn.Module):
         self.hidden_dim = intervention_config.hidden_dim
         self.support_size = int(self.runtime_config.get("support_size", payload["config"]["support_size"]))
         self.support_seed = int(self.runtime_config.get("support_seed", 7))
+        self.training_seed = int(payload["config"]["seed"])
         self.intervention_strength = float(self.runtime_config.get("intervention_strength", 0.5))
         self.strict = bool(self.runtime_config.get("strict", True))
         self.verify_hashes = bool(self.runtime_config.get("verify_artifact_hashes", True))
@@ -449,7 +450,7 @@ class FactorialMetaSubspaceRuntime(nn.Module):
     def _raw_support(self, row: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         if not row["query_indices"]:
             raise ValueError("Support episode has no full action window")
-        seed = _private_seed([CHECKPOINT_PROTOCOL, self.support_seed, row["path"], "support-chunk"])
+        seed = _private_seed([CHECKPOINT_PROTOCOL, self.training_seed, row["path"], "support-chunk"])
         index = row["query_indices"][seed % len(row["query_indices"])]
         with np.load(self._episode_path(row), allow_pickle=False) as data:
             start = int(data["query_steps"][index])
@@ -541,7 +542,7 @@ class FactorialMetaSubspaceRuntime(nn.Module):
 
         if self.spec["inner_steps"]:
             raw_rows, records = zip(*(self._raw_support(row) for row in supports), strict=True)
-            noise_seed = _private_seed([CHECKPOINT_PROTOCOL, self.support_seed, list(records), "support-flow"])
+            noise_seed = _private_seed([CHECKPOINT_PROTOCOL, self.training_seed, list(records), "support-flow"])
             with torch.inference_mode(False), torch.enable_grad():
                 logits = self.adapter.intervention.mask(code).float().detach().requires_grad_(True)
                 flow = self._support_flow_loss(list(raw_rows), code, logits, seed=noise_seed)
