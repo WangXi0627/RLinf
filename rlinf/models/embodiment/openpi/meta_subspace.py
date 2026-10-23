@@ -669,9 +669,18 @@ def install_meta_subspace(
     if not bool(runtime_config.get("enabled", False)):
         model.meta_subspace_runtime = None
         return None
-    runtime = MetaSubspaceRuntime(
-        runtime_config, base_checkpoint_dir=base_checkpoint_dir
-    )
+    if str(runtime_config.get("runtime", "legacy")) == "residual_mask_factorial":
+        from rlinf.models.embodiment.openpi.factorial_meta_subspace import (
+            FactorialMetaSubspaceRuntime,
+        )
+
+        runtime = FactorialMetaSubspaceRuntime(
+            runtime_config, base_checkpoint_dir=base_checkpoint_dir
+        )
+    else:
+        runtime = MetaSubspaceRuntime(
+            runtime_config, base_checkpoint_dir=base_checkpoint_dir
+        )
     model.meta_subspace_runtime = runtime
     runtime.install(model)
     return runtime
