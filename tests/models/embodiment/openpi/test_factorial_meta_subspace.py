@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from rlinf.models.embodiment.openpi.factorial_meta_subspace import (
+    FactorialMetaSubspaceRuntime,
     SupportConditionedResidualMask,
     SupportTaskEncoderConfig,
     TaskResidualMaskConfig,
@@ -61,6 +62,22 @@ class FactorialMetaSubspaceTest(unittest.TestCase):
         )
         torch.testing.assert_close(output[~image_mask], hidden[~image_mask])
         self.assertFalse(torch.equal(output[image_mask], hidden[image_mask]))
+
+    def test_runtime_model_back_reference_is_not_registered(self):
+        runtime = FactorialMetaSubspaceRuntime.__new__(
+            FactorialMetaSubspaceRuntime
+        )
+        torch.nn.Module.__init__(runtime)
+        runtime._model_ref = None
+
+        policy = torch.nn.Module()
+        policy.meta_subspace_runtime = runtime
+        runtime._bind_model(policy)
+
+        self.assertIs(runtime.model, policy)
+        self.assertNotIn("model", runtime._modules)
+        self.assertEqual(list(policy.modules()), [policy, runtime])
+        policy.to("cpu")
 
     def test_private_seed_is_stable_and_scoped(self):
         value = [
