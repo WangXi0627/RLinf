@@ -117,7 +117,7 @@ PY
     echo "No libero_goal tasks for category ${LIBERO_CATEGORY}" >&2
     exit 2
   fi
-  epochs=$(( (count + TOTAL_NUM_ENVS - 1) / TOTAL_NUM_ENVS ))
+  epochs=$(( (count + TOTAL_NUM_ENVS - 1) / TOTAL_NUM_ENVS ))\n  if [[ -n "${EVAL_EPOCHS:-}" ]]; then\n    epochs="${EVAL_EPOCHS}"\n  fi
   echo "Evaluating arm=${arm} category=${LIBERO_CATEGORY} tasks=${count} envs=${TOTAL_NUM_ENVS} epochs=${epochs}"
   ray stop --force >/dev/null 2>&1 || true
   LOG_ROOT="${RESULT_ROOT}/${arm}/${category_key}" \
