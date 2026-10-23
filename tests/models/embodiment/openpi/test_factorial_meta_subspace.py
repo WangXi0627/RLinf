@@ -63,6 +63,29 @@ class FactorialMetaSubspaceTest(unittest.TestCase):
         torch.testing.assert_close(output[~image_mask], hidden[~image_mask])
         self.assertFalse(torch.equal(output[image_mask], hidden[image_mask]))
 
+    def test_wrapper_consumes_openpi_layer_metadata(self):
+        adapter = make_adapter("task_residual_mask")
+        hidden = torch.randn(1, 3, 8)
+        context = {
+            "task_code": torch.randn(1, 4),
+            "image_token_mask": torch.ones(1, 3, dtype=torch.bool),
+            "strength": 1.0,
+            "layer_index": 14,
+        }
+        output = adapter(
+            hidden,
+            site="pre_joint_layer_15",
+            context=context,
+        )
+        torch.testing.assert_close(output, hidden)
+
+        with self.assertRaisesRegex(ValueError, "site/layer mismatch"):
+            adapter(
+                hidden,
+                site="pre_joint_layer_15",
+                context={**context, "layer_index": 13},
+            )
+
     def test_runtime_model_back_reference_is_not_registered(self):
         runtime = FactorialMetaSubspaceRuntime.__new__(
             FactorialMetaSubspaceRuntime
