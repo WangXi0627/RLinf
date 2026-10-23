@@ -209,7 +209,25 @@ class SupportConditionedResidualMask(nn.Module):
     ) -> torch.Tensor:
         if site != self.intervention.config.site:
             return hidden_states
-        return self.intervention(hidden_states, **dict(context or {}))
+        payload = dict(context or {})
+        layer_index = payload.pop("layer_index", None)
+        expected_layer = SITE_TO_LAYER_INDEX[site]
+        if layer_index is not None and int(layer_index) != expected_layer:
+            raise ValueError(
+                f"Intervention site/layer mismatch: {site} != layer {layer_index}"
+            )
+        allowed = {
+            "task_code",
+            "image_token_mask",
+            "strength",
+            "mask_logits",
+            "delta_u",
+            "sample_mask",
+        }
+        unexpected = sorted(set(payload) - allowed)
+        if unexpected:
+            raise TypeError(f"Unexpected factorial intervention context: {unexpected}")
+        return self.intervention(hidden_states, **payload)
 
 
 @dataclass(frozen=True)
