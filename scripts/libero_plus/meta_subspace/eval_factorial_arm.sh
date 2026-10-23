@@ -96,6 +96,11 @@ print("source_ids:", manifest_doc.get("source_ids", [manifest_doc.get("source_id
 print("feature_cache:", feature_index.parent)
 PY
 
+if [[ "${FACTORIAL_PREFLIGHT_ONLY:-0}" == "1" ]]; then
+  echo "Factorial preflight-only check completed"
+  exit 0
+fi
+
 category_name() {
   case "$1" in
     background_textures) echo "Background Textures" ;;
