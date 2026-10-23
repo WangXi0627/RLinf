@@ -1,0 +1,90 @@
+defaults:
+  - env/libero_goal@env.eval
+  - model/pi0@rollout.model
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: all
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results/pi0/residual_mask_factorial_eval"
+    project_name: rlinf
+    experiment_name: "pi0_liberoplus_goal_${oc.env:FACTORIAL_ARM}"
+    logger_backends: ["tensorboard"]
+  max_epochs: 1
+  max_steps: -1
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 25
+    auto_reset: True
+    ignore_terminations: True
+    max_episode_steps: 300
+    max_steps_per_rollout_epoch: 300
+    group_size: 1
+    use_fixed_reset_state_ids: True
+    is_eval: True
+    seed: 7
+    num_steps_wait: 10
+    plus_category: ${oc.env:LIBERO_CATEGORY}
+    plus_classification_path: ${oc.env:LIBERO_CLASSIFICATION_PATH}
+    plus_strict_manifest: True
+    video_cfg:
+      save_video: False
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  recompute_logprobs: False
+  unnorm_key: "libero_10"
+  enable_offload: False
+  pipeline_stage_num: 1
+  model:
+    model_path: ${oc.env:OPENPI_CHECKPOINT}
+    model_type: "openpi"
+    num_action_chunks: 5
+    num_steps: 10
+    add_value_head: False
+    openpi:
+      task: "eval"
+      config_name: "pi0_libero"
+      noise_method: "flow_ode"
+      noise_level: 0.0
+      action_horizon: 50
+      train_action_expert: False
+      train_action_head: False
+      meta_subspace:
+        enabled: True
+        runtime: "residual_mask_factorial"
+        checkpoint_path: ${oc.env:FACTORIAL_CHECKPOINT}
+        manifest_path: ${oc.env:META_SUBSPACE_MANIFEST}
+        feature_dir: ${oc.env:META_SUBSPACE_FEATURE_DIR}
+        task_mapping_path: ${oc.env:META_SUBSPACE_TASK_MAPPING}
+        base_config: "pi0_libero"
+        support_size: 2
+        support_seed: 7
+        intervention_strength: ${oc.env:INTERVENTION_STRENGTH,0.5}
+        action_mode: ${oc.env:FACTORIAL_ACTION_MODE,all_meta}
+        strict: True
+        verify_artifact_hashes: True
+        verify_base_identity: True
