@@ -8,7 +8,7 @@ case "${arm}" in
 esac
 
 export RLINF_ROOT="${RLINF_ROOT:-/data/Xixixi/VLA1/RLinf}"
-export PCD_ROOT="${PCD_ROOT:-/data/Xixixi/VLA1/PCD-meta-subspace}"
+export PCD_ROOT="${PCD_ROOT:-/data/Xixixi/VLA1/PCD-meta-subspace}"\nexport OPENPI_ROOT="${OPENPI_ROOT:-/data/Xixixi/VLA1/openpi-meta-subspace}"\nexport PYTHONPATH="${RLINF_ROOT}:${OPENPI_ROOT}/src:${PYTHONPATH:-}"
 export OPENPI_CHECKPOINT="${OPENPI_CHECKPOINT:-/data/Xixixi/VLA1/model_cache/openpi/openpi-assets/checkpoints/pi0_libero_pytorch}"
 export META_ROOT="${META_ROOT:-${PCD_ROOT}/results/libero_plus_meta_subspace/v2}"
 export META_SUBSPACE_MANIFEST="${META_SUBSPACE_MANIFEST:-${META_ROOT}/manifests/goal5_mixed_pool.json}"
@@ -64,7 +64,7 @@ def sha(path):
             digest.update(chunk)
     return digest.hexdigest()
 
-payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+assert "intervention_context" in inspect.signature(PI0Pytorch.flow_velocity).parameters, (\n    "Pull feature/liberoplus-task-residual-mask-bilevel-v1 in OPENPI_ROOT"\n)\npayload = torch.load(checkpoint, map_location="cpu", weights_only=True)
 assert payload["schema_version"] == 2
 assert payload["method"] == "libero-plus-task-residual-mask-factorial"
 assert payload["protocol"] == "libero-plus-task-residual-mask-factorial-v1"
