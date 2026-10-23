@@ -40,7 +40,7 @@ Valid arms are `b_residual`, `c1_joint_mask`, `c2_bilevel`, and
 The default five categories are Background Textures, Light Conditions,
 Objects Layout, Camera Viewpoints, and Sensor Noise.  Restrict a smoke test
 with, for example,
-`EVAL_CATEGORY_KEYS="sensor_noise" TOTAL_NUM_ENVS=2`.
+`EVAL_CATEGORY_KEYS="sensor_noise" TOTAL_NUM_ENVS=2 EVAL_EPOCHS=1`.
 
 Use the same `INTERVENTION_STRENGTH`, `FACTORIAL_ACTION_MODE`, category
 scope, seed, checkpoint step, and task ordering for every arm.  Set
