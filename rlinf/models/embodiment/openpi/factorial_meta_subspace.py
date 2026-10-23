@@ -124,8 +124,13 @@ class TaskResidualMask(nn.Module):
                 nn.GELU(),
                 nn.Linear(config.conditioner_hidden_dim, config.hidden_dim),
             )
+            nn.init.zeros_(self.mask[-1].weight)
+            nn.init.zeros_(self.mask[-1].bias)
         if config.intervention_type == "task_residual_mask_c3":
             self.delta_condition_proj = nn.Linear(config.hidden_dim, config.residual_hidden_dim, bias=False)
+            nn.init.zeros_(self.delta_condition_proj.weight)
+        nn.init.zeros_(self.up_proj.weight)
+        nn.init.zeros_(self.up_proj.bias)
 
     def forward(
         self,
