@@ -332,6 +332,10 @@ class FactorialMetaSubspaceRuntime(nn.Module):
         adapter_config = payload["adapter_config"]
         encoder_config = SupportTaskEncoderConfig(**adapter_config["encoder"])
         intervention_config = TaskResidualMaskConfig(**adapter_config["intervention"])
+        if intervention_config.intervention_type != spec["intervention_type"]:
+            raise ValueError("Checkpoint intervention type does not match its arm")
+        if self.mask_guided and intervention_config.guide_signal != spec["guide_signal"]:
+            raise ValueError("Checkpoint guide signal does not match its arm")
         self.adapter = SupportConditionedResidualMask(encoder_config, intervention_config)
         if set(payload["adapter"]) != set(self.adapter.state_dict()):
             raise ValueError("Factorial checkpoint tensor keys do not match")
