@@ -353,7 +353,13 @@ class FactorialMetaSubspaceRuntime(nn.Module):
         self.training_seed = int(payload["config"]["seed"])
         self.intervention_strength = float(self.runtime_config.get("intervention_strength", 0.5))
         self.strict = bool(self.runtime_config.get("strict", True))
-        self.no_inner_update = bool(self.runtime_config.get("no_inner_update", False))
+        no_inner = self.runtime_config.get("no_inner_update", False)
+        if isinstance(no_inner, str):
+            normalized = no_inner.strip().lower()
+            if normalized not in {"0", "1", "false", "true"}:
+                raise ValueError("no_inner_update must be a boolean")
+            no_inner = normalized in {"1", "true"}
+        self.no_inner_update = bool(no_inner)
         if self.no_inner_update and not self.mask_guided:
             raise ValueError("no_inner_update is valid only for mask-guided checkpoints")
         self.verify_hashes = bool(self.runtime_config.get("verify_artifact_hashes", True))
