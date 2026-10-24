@@ -30,6 +30,8 @@ from rlinf.utils.pytree import register_pytree_dataclasses
 
 CHECKPOINT_METHOD = "libero-plus-task-residual-mask-factorial"
 CHECKPOINT_PROTOCOL = "libero-plus-task-residual-mask-factorial-v1"
+MASK_GUIDED_METHOD = "libero-plus-mask-guided-residual"
+MASK_GUIDED_PROTOCOL = "libero-plus-mask-guided-residual-v1"
 SITE_TO_LAYER_INDEX = {"pre_joint_layer_9": 8, "pre_joint_layer_12": 11, "pre_joint_layer_15": 14}
 ACTION_MODES = ("all_meta", "meta_action6_base_gripper")
 ARM_SPECS = {
@@ -37,6 +39,12 @@ ARM_SPECS = {
     "c1_joint_mask": {"intervention_type": "task_residual_mask", "inner_steps": 0, "second_order": False, "delta_condition": False},
     "c2_bilevel": {"intervention_type": "task_residual_mask", "inner_steps": 1, "second_order": True, "delta_condition": False},
     "c3_full": {"intervention_type": "task_residual_mask_c3", "inner_steps": 1, "second_order": True, "delta_condition": True},
+}
+MASK_GUIDED_ARM_SPECS = {
+    "importance_fo": {"intervention_type": "mask_guided_residual", "inner_steps": 1, "guide_signal": "importance", "second_order": False},
+    "importance_so": {"intervention_type": "mask_guided_residual", "inner_steps": 1, "guide_signal": "importance", "second_order": True},
+    "delta_fo": {"intervention_type": "mask_guided_residual", "inner_steps": 1, "guide_signal": "delta", "second_order": False},
+    "delta_so": {"intervention_type": "mask_guided_residual", "inner_steps": 1, "guide_signal": "delta", "second_order": True},
 }
 
 
@@ -88,6 +96,7 @@ class TaskResidualMaskConfig:
     task_code_dim: int
     conditioner_hidden_dim: int
     residual_hidden_dim: int
+    guide_signal: str | None = None
     rms_norm_eps: float = 1e-6
     strength: float = 1.0
     capture_regularization: bool = False
@@ -131,6 +140,9 @@ class TaskResidualMask(nn.Module):
         if config.intervention_type == "task_residual_mask_c3":
             self.delta_condition_proj = nn.Linear(config.hidden_dim, config.residual_hidden_dim, bias=False)
             nn.init.zeros_(self.delta_condition_proj.weight)
+        if config.intervention_type == "mask_guided_residual":
+            self.guide_condition_proj = nn.Linear(config.hidden_dim, config.residual_hidden_dim, bias=False)
+            nn.init.zeros_(self.guide_condition_proj.weight)
         nn.init.zeros_(self.up_proj.weight)
         nn.init.zeros_(self.up_proj.bias)
 
@@ -143,6 +155,9 @@ class TaskResidualMask(nn.Module):
         strength: float,
         mask_logits: torch.Tensor | None = None,
         delta_u: torch.Tensor | None = None,
+        guide_condition: torch.Tensor | None = None,
+        mask_importance: torch.Tensor | None = None,
+        diagnostic_mask: bool = False,
         sample_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch, tokens, hidden = hidden_states.shape
@@ -176,7 +191,26 @@ class TaskResidualMask(nn.Module):
                     delta_u.to(device=hidden_states.device, dtype=torch.float32)
                 )
             preactivation = preactivation + projected[:, None].to(preactivation.dtype)
+        if guide_condition is not None:
+            if self.config.intervention_type != "mask_guided_residual" or diagnostic_mask:
+                raise ValueError("guide_condition is valid only on mask-guided Query forwards")
+            if tuple(guide_condition.shape) != (batch, hidden):
+                raise ValueError("Mask-guided condition shape mismatch")
+            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                projected = self.guide_condition_proj(
+                    guide_condition.to(device=hidden_states.device, dtype=torch.float32)
+                )
+            preactivation = preactivation + projected[:, None].to(preactivation.dtype)
         residual = self.up_proj(F.gelu(preactivation)).float()
+
+        if self.config.intervention_type == "mask_guided_residual" and not diagnostic_mask:
+            if guide_condition is None or mask_importance is None:
+                raise ValueError("Mask-guided Query requires guide_condition and mask_importance")
+            if tuple(mask_importance.shape) != (batch, hidden):
+                raise ValueError("Mask-guided importance shape mismatch")
+            adapted = raw + strength * residual
+            selected = image_token_mask.bool() & sample_mask[:, None].bool()
+            return torch.where(selected[..., None], adapted.to(hidden_states.dtype), hidden_states)
 
         if self.config.intervention_type == "task_residual_mlp":
             if mask_logits is not None:
@@ -222,6 +256,9 @@ class SupportConditionedResidualMask(nn.Module):
             "strength",
             "mask_logits",
             "delta_u",
+            "guide_condition",
+            "mask_importance",
+            "diagnostic_mask",
             "sample_mask",
         }
         unexpected = sorted(set(payload) - allowed)
@@ -268,18 +305,28 @@ class FactorialMetaSubspaceRuntime(nn.Module):
                 raise FileNotFoundError(f"Factorial evaluation input does not exist: {path}")
 
         payload = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-        if (
-            payload.get("schema_version") != 2
-            or payload.get("method") != CHECKPOINT_METHOD
-            or payload.get("protocol") != CHECKPOINT_PROTOCOL
-        ):
-            raise ValueError(f"Unknown factorial checkpoint: {checkpoint_path}")
+        if payload.get("schema_version") != 2:
+            raise ValueError(f"Unknown meta-subspace checkpoint: {checkpoint_path}")
+        identity = (payload.get("method"), payload.get("protocol"))
+        self.mask_guided = identity == (MASK_GUIDED_METHOD, MASK_GUIDED_PROTOCOL)
+        if not self.mask_guided and identity != (CHECKPOINT_METHOD, CHECKPOINT_PROTOCOL):
+            raise ValueError(f"Unknown meta-subspace checkpoint: {checkpoint_path}")
         arm = str(payload["config"]["arm"])
-        if arm not in ARM_SPECS:
-            raise ValueError(f"Unknown factorial arm: {arm}")
-        spec = ARM_SPECS[arm]
-        for key in ("intervention_type", "inner_steps", "second_order"):
-            if payload["config"].get(key) != spec[key]:
+        specs = MASK_GUIDED_ARM_SPECS if self.mask_guided else ARM_SPECS
+        if arm not in specs:
+            raise ValueError(f"Unknown checkpoint arm: {arm}")
+        spec = specs[arm]
+        checked = ("inner_steps", "second_order")
+        if self.mask_guided:
+            checked += ("guide_signal",)
+        else:
+            checked += ("intervention_type",)
+        for key in checked:
+            actual = (
+                payload["adapter_config"]["intervention"].get("intervention_type")
+                if key == "intervention_type" else payload["config"].get(key)
+            )
+            if actual != spec[key]:
                 raise ValueError(f"Checkpoint arm/config mismatch for {key}")
 
         adapter_config = payload["adapter_config"]
@@ -306,6 +353,9 @@ class FactorialMetaSubspaceRuntime(nn.Module):
         self.training_seed = int(payload["config"]["seed"])
         self.intervention_strength = float(self.runtime_config.get("intervention_strength", 0.5))
         self.strict = bool(self.runtime_config.get("strict", True))
+        self.no_inner_update = bool(self.runtime_config.get("no_inner_update", False))
+        if self.no_inner_update and not self.mask_guided:
+            raise ValueError("no_inner_update is valid only for mask-guided checkpoints")
         self.verify_hashes = bool(self.runtime_config.get("verify_artifact_hashes", True))
         self.inner_lr = float(payload["config"]["inner_lr"])
         self.flow_prefix_steps = int(payload["config"]["flow_prefix_steps"])
@@ -581,6 +631,7 @@ class FactorialMetaSubspaceRuntime(nn.Module):
             "task_code": code.expand(len(raw_rows), -1),
             "mask_logits": logits.expand(len(raw_rows), -1),
             "strength": 1.0,
+            "diagnostic_mask": self.mask_guided,
         }
         (_, suffix_out), _ = self.model.paligemma_with_expert.forward(
             attention_mask=attention,
@@ -627,20 +678,42 @@ class FactorialMetaSubspaceRuntime(nn.Module):
                 flow = self._support_flow_loss(list(raw_rows), code, logits, seed=noise_seed)
                 identity = (2.0 * torch.sigmoid(logits) - 1.0).square().mean()
                 gradient, = torch.autograd.grad(flow + self.mask_weight * identity, logits)
-                delta_u = -self.inner_lr * gradient
+                raw_delta_u = -self.inner_lr * gradient
+                delta_u = torch.zeros_like(raw_delta_u) if self.no_inner_update else raw_delta_u
                 updated = logits + delta_u
             if not torch.isfinite(updated).all():
-                raise FloatingPointError("Non-finite factorial inner update")
-            state["mask_logits"] = updated.detach()
-            if self.spec["delta_condition"]:
-                state["delta_u"] = delta_u.detach()
+                raise FloatingPointError("Non-finite meta-subspace inner update")
+            if self.mask_guided:
+                initial_mask = 2.0 * torch.sigmoid(logits)
+                adapted_mask = 2.0 * torch.sigmoid(updated)
+                importance = adapted_mask - 1.0
+                delta_mask = adapted_mask - initial_mask
+                guide = importance if self.spec["guide_signal"] == "importance" else delta_mask
+                state["mask_importance"] = importance.detach()
+                state["guide_condition"] = guide.detach()
+            else:
+                state["mask_logits"] = updated.detach()
+                if self.spec["delta_condition"]:
+                    state["delta_u"] = delta_u.detach()
             details.update(
                 adapted_logits_sha256=_tensor_hash(updated), delta_u_sha256=_tensor_hash(delta_u),
                 inner_grad_rms=float(gradient.detach().square().mean().sqrt().cpu()),
                 inner_logit_max_abs_delta=float(delta_u.detach().abs().max().cpu()),
                 inner_support_samples=[{"supports": list(records), "flow_seed": noise_seed, "flow_loss": float(flow.detach().cpu())}],
-                inner_update_computed=True, delta_condition_retained=bool(self.spec["delta_condition"]),
+                inner_update_computed=True,
+                inner_update_applied=not self.no_inner_update,
+                delta_condition_retained=bool(self.spec.get("delta_condition", False)),
+                query_direct_mask=False if self.mask_guided else True,
             )
+            if self.mask_guided:
+                details.update(
+                    guide_signal=self.spec["guide_signal"],
+                    importance_sha256=_tensor_hash(importance),
+                    delta_mask_sha256=_tensor_hash(delta_mask),
+                    guide_condition_sha256=_tensor_hash(guide),
+                    importance_rms=float(importance.detach().square().mean().sqrt().cpu()),
+                    delta_mask_rms=float(delta_mask.detach().square().mean().sqrt().cpu()),
+                )
         return state, details
 
     def _state_for(self, base_task_id: str, category: str):
@@ -686,13 +759,25 @@ class FactorialMetaSubspaceRuntime(nn.Module):
             "sample_mask": torch.tensor([state is not None for state in states], device=device, dtype=torch.bool),
             "strength": self.intervention_strength,
         }
-        if self.spec["inner_steps"]:
+        if self.mask_guided:
+            context["guide_condition"] = torch.stack([
+                state["guide_condition"][0].to(device=device, dtype=torch.float32) if state is not None
+                else torch.zeros(self.hidden_dim, device=device)
+                for state in states
+            ])
+            context["mask_importance"] = torch.stack([
+                state["mask_importance"][0].to(device=device, dtype=torch.float32) if state is not None
+                else torch.zeros(self.hidden_dim, device=device)
+                for state in states
+            ])
+            context["diagnostic_mask"] = False
+        elif self.spec["inner_steps"]:
             context["mask_logits"] = torch.stack([
                 state["mask_logits"][0].to(device=device, dtype=torch.float32) if state is not None
                 else torch.zeros(self.hidden_dim, device=device)
                 for state in states
             ])
-        if self.spec["delta_condition"]:
+        if self.spec.get("delta_condition", False):
             context["delta_u"] = torch.stack([
                 state["delta_u"][0].to(device=device, dtype=torch.float32) if state is not None
                 else torch.zeros(self.hidden_dim, device=device)
@@ -707,6 +792,7 @@ class FactorialMetaSubspaceRuntime(nn.Module):
             "factorial_arm": self.arm, "factorial_spec": self.spec,
             "support_size": self.support_size, "support_seed": self.support_seed,
             "intervention_strength": self.intervention_strength,
+            "mask_guided": self.mask_guided, "no_inner_update": self.no_inner_update,
             "action_mode": self.action_mode, "cached_task_states": len(self._states),
             "task_states": list(self._state_details.values()),
         }
