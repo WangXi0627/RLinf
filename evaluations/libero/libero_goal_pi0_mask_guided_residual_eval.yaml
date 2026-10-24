@@ -35,7 +35,7 @@ env:
   group_name: "EnvGroup"
   eval:
     rollout_epoch: 1
-    total_num_envs: 25
+    total_num_envs: 35
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 300
