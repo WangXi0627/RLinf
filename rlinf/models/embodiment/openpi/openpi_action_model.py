@@ -889,10 +889,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             is_dsrl_active
             and meta_context is not None
             and self.meta_subspace_runtime is not None
-            and self.meta_subspace_runtime.uses_base_gripper
+            and self.meta_subspace_runtime.requires_base_actions
         ):
             raise RuntimeError(
-                "Meta-Subspace base-gripper evaluation is not supported with DSRL"
+                "Meta-Subspace base-policy comparison is not supported with DSRL"
             )
         if is_dsrl_active:
             # DSRL mode (both train and eval)
@@ -927,12 +927,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         else:
             # Non-DSRL or eval mode
             shared_noise = None
-            use_base_gripper = (
-                meta_context is not None
-                and self.meta_subspace_runtime is not None
-                and self.meta_subspace_runtime.uses_base_gripper
+            use_base_comparison = (
+                self.meta_subspace_runtime is not None
+                and self.meta_subspace_runtime.requires_base_actions
             )
-            if use_base_gripper:
+            if use_base_comparison:
+                self.meta_subspace_runtime.reset_query_diagnostics()
                 shared_noise = self.sample_noise(
                     (
                         observation.state.shape[0],
@@ -961,7 +961,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     compute_values=compute_values,
                     meta_context=meta_context,
                 )
-            if use_base_gripper:
+            if use_base_comparison:
                 if rtc_context is not None and self.config.rtc_enabled:
                     base_outputs = self.sample_actions_with_rtc_guidance(
                         observation,
