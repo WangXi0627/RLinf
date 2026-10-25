@@ -105,6 +105,48 @@ class FactorialMetaSubspaceTest(unittest.TestCase):
         self.assertTrue(MASK_GUIDED_ARM_SPECS["importance_so"]["second_order"])
         self.assertEqual(MASK_GUIDED_ARM_SPECS["delta_fo"]["guide_signal"], "delta")
 
+    def test_conservative_gate_selects_whole_action_chunks(self):
+        runtime = FactorialMetaSubspaceRuntime.__new__(
+            FactorialMetaSubspaceRuntime
+        )
+        torch.nn.Module.__init__(runtime)
+        runtime.action_mode = "conservative_gate"
+        runtime.action_gate_horizon = 5
+        runtime.action_gate_max_mean_abs_delta = 0.05
+        runtime.residual_gate_max_relative_rms = 0.10
+        runtime.adapter = make_adapter("mask_guided_residual", "importance")
+        runtime._last_gate_metrics = {}
+        runtime.adapter.intervention._last_relative_residual_rms = torch.tensor(
+            [0.05, 0.20]
+        )
+
+        base = torch.zeros(2, 10, 7)
+        meta = torch.full_like(base, 0.02)
+        combined = runtime.combine_actions(meta, base)
+        torch.testing.assert_close(combined[0], meta[0])
+        torch.testing.assert_close(combined[1], base[1])
+        self.assertEqual(runtime._last_gate_metrics["accepted"], [True, False])
+
+    def test_mask_guided_query_records_relative_residual_rms(self):
+        adapter = make_adapter("mask_guided_residual", "importance").intervention
+        with torch.no_grad():
+            adapter.up_proj.weight.fill_(0.1)
+        hidden = torch.randn(2, 3, 8)
+        adapter(
+            hidden,
+            task_code=torch.randn(2, 4),
+            image_token_mask=torch.tensor(
+                [[True, True, False], [True, False, True]]
+            ),
+            strength=0.25,
+            guide_condition=torch.randn(2, 8),
+            mask_importance=torch.randn(2, 8),
+            diagnostic_mask=False,
+        )
+        value = adapter._last_relative_residual_rms
+        self.assertEqual(tuple(value.shape), (2,))
+        self.assertTrue(torch.isfinite(value).all())
+
     def test_wrapper_consumes_openpi_layer_metadata(self):
         adapter = make_adapter("task_residual_mask")
         hidden = torch.randn(1, 3, 8)
