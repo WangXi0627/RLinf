@@ -758,7 +758,11 @@ class FactorialMetaSubspaceRuntime(nn.Module):
         features = np.stack([self._feature(row) for row in supports])[None]
         with torch.no_grad():
             code = self.adapter.encode_support(torch.as_tensor(features, device=parameter.device, dtype=torch.float32)).detach()
-        state = {"task_code": code, "strength": self.intervention_strength}
+        state = {
+            "task_code": code,
+            "strength": self.intervention_strength,
+            "gate_enabled": True,
+        }
         details.update(task_code_sha256=_tensor_hash(code), inner_update_computed=False, delta_condition_retained=False)
 
         if self.spec["inner_steps"]:
@@ -836,7 +840,8 @@ class FactorialMetaSubspaceRuntime(nn.Module):
                         identity_fallback=True,
                         fallback_reason="support_loss_gate",
                     )
-                    return None, details
+                    state["gate_enabled"] = False
+                    return state, details
         return state, details
 
     def _state_for(self, base_task_id: str, category: str):
@@ -879,7 +884,14 @@ class FactorialMetaSubspaceRuntime(nn.Module):
                 else torch.zeros(self.task_code_dim, device=device)
                 for state in states
             ]),
-            "sample_mask": torch.tensor([state is not None for state in states], device=device, dtype=torch.bool),
+            "sample_mask": torch.tensor(
+                [
+                    state is not None and state.get("gate_enabled", True)
+                    for state in states
+                ],
+                device=device,
+                dtype=torch.bool,
+            ),
             "strength": self.intervention_strength,
         }
         if self.mask_guided:
