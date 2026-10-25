@@ -170,6 +170,23 @@ class FactorialMetaSubspaceTest(unittest.TestCase):
                 context={**context, "layer_index": 13},
             )
 
+    def test_zero_strength_bypasses_strict_support_adaptation(self):
+        runtime = FactorialMetaSubspaceRuntime.__new__(
+            FactorialMetaSubspaceRuntime
+        )
+        torch.nn.Module.__init__(runtime)
+        runtime.intervention_strength = 0.0
+        context = runtime.prepare_context(
+            {
+                "meta_suite_names": ["libero_goal"],
+                "meta_task_ids": [0],
+                "meta_task_names": ["task"],
+                "meta_perturbation_categories": ["Sensor Noise"],
+            },
+            device=torch.device("cpu"),
+        )
+        self.assertIsNone(context)
+
     def test_runtime_model_back_reference_is_not_registered(self):
         runtime = FactorialMetaSubspaceRuntime.__new__(
             FactorialMetaSubspaceRuntime
