@@ -33,7 +33,7 @@ CHECKPOINT_PROTOCOL = "libero-plus-task-residual-mask-factorial-v1"
 MASK_GUIDED_METHOD = "libero-plus-mask-guided-residual"
 MASK_GUIDED_PROTOCOL = "libero-plus-mask-guided-residual-v1"
 SITE_TO_LAYER_INDEX = {"pre_joint_layer_9": 8, "pre_joint_layer_12": 11, "pre_joint_layer_15": 14}
-ACTION_MODES = ("all_meta", "meta_action6_base_gripper")
+ACTION_MODES = ("all_meta", "meta_action6_base_gripper", "conservative_gate")
 ARM_SPECS = {
     "b_residual": {"intervention_type": "task_residual_mlp", "inner_steps": 0, "second_order": False, "delta_condition": False},
     "c1_joint_mask": {"intervention_type": "task_residual_mask", "inner_steps": 0, "second_order": False, "delta_condition": False},
@@ -145,6 +145,7 @@ class TaskResidualMask(nn.Module):
             nn.init.zeros_(self.guide_condition_proj.weight)
         nn.init.zeros_(self.up_proj.weight)
         nn.init.zeros_(self.up_proj.bias)
+        self._last_relative_residual_rms: torch.Tensor | None = None
 
     def forward(
         self,
@@ -210,6 +211,16 @@ class TaskResidualMask(nn.Module):
                 raise ValueError("Mask-guided importance shape mismatch")
             adapted = raw + strength * residual
             selected = image_token_mask.bool() & sample_mask[:, None].bool()
+            counts = selected.sum(dim=1).clamp_min(1).to(dtype=torch.float32)
+            residual_power = (
+                residual.float().square() * selected[..., None]
+            ).sum(dim=(1, 2)) / (counts * hidden)
+            raw_power = (
+                raw.square() * selected[..., None]
+            ).sum(dim=(1, 2)) / (counts * hidden)
+            self._last_relative_residual_rms = (
+                residual_power.sqrt() / raw_power.sqrt().clamp_min(1e-12)
+            ).detach()
             return torch.where(selected[..., None], adapted.to(hidden_states.dtype), hidden_states)
 
         if self.config.intervention_type == "task_residual_mlp":
@@ -367,6 +378,37 @@ class FactorialMetaSubspaceRuntime(nn.Module):
         self.no_inner_update = bool(no_inner)
         if self.no_inner_update and not self.mask_guided:
             raise ValueError("no_inner_update is valid only for mask-guided checkpoints")
+        self.inner_update_scale = float(
+            self.runtime_config.get("inner_update_scale", 1.0)
+        )
+        self.support_gate_min_relative_improvement = float(
+            self.runtime_config.get(
+                "support_gate_min_relative_improvement", -1.0
+            )
+        )
+        self.residual_gate_max_relative_rms = float(
+            self.runtime_config.get("residual_gate_max_relative_rms", -1.0)
+        )
+        self.action_gate_max_mean_abs_delta = float(
+            self.runtime_config.get("action_gate_max_mean_abs_delta", -1.0)
+        )
+        self.action_gate_horizon = int(
+            self.runtime_config.get("action_gate_horizon", 5)
+        )
+        if not 0.0 <= self.inner_update_scale <= 1.0:
+            raise ValueError("inner_update_scale must be in [0, 1]")
+        if self.action_mode == "conservative_gate" and not self.mask_guided:
+            raise ValueError("conservative_gate requires a mask-guided checkpoint")
+        if self.action_mode == "conservative_gate" and (
+            self.residual_gate_max_relative_rms < 0
+            or self.action_gate_max_mean_abs_delta < 0
+        ):
+            raise ValueError(
+                "conservative_gate requires residual/action gate thresholds"
+            )
+        if not 0 < self.action_gate_horizon <= int(payload["config"]["action_horizon"]):
+            raise ValueError("Invalid action_gate_horizon")
+        self._last_gate_metrics: dict[str, Any] = {}
         self.verify_hashes = bool(self.runtime_config.get("verify_artifact_hashes", True))
         self.inner_lr = float(payload["config"]["inner_lr"])
         self.flow_prefix_steps = int(payload["config"]["flow_prefix_steps"])
@@ -425,14 +467,52 @@ class FactorialMetaSubspaceRuntime(nn.Module):
     def uses_base_gripper(self) -> bool:
         return self.action_mode == "meta_action6_base_gripper"
 
+    @property
+    def requires_base_actions(self) -> bool:
+        return self.uses_base_gripper or self.action_mode == "conservative_gate"
+
+    def reset_query_diagnostics(self) -> None:
+        self._last_gate_metrics = {}
+        if self.adapter is not None:
+            self.adapter.intervention._last_relative_residual_rms = None
+
     def combine_actions(self, meta_actions: torch.Tensor, base_actions: torch.Tensor) -> torch.Tensor:
-        if not self.uses_base_gripper:
+        if not self.requires_base_actions:
             return meta_actions
         if meta_actions.shape != base_actions.shape or meta_actions.shape[-1] < 7:
-            raise ValueError("Invalid actions for base-gripper mixing")
-        combined = meta_actions.clone()
-        combined[..., 6] = base_actions[..., 6].to(dtype=combined.dtype)
-        return combined
+            raise ValueError("Invalid actions for base-policy comparison")
+        if self.uses_base_gripper:
+            combined = meta_actions.clone()
+            combined[..., 6] = base_actions[..., 6].to(dtype=combined.dtype)
+            return combined
+
+        action_delta = (
+            meta_actions[:, : self.action_gate_horizon, :7].float()
+            - base_actions[:, : self.action_gate_horizon, :7].float()
+        ).abs().mean(dim=(1, 2))
+        residual_rms = self.adapter.intervention._last_relative_residual_rms
+        if residual_rms is None or residual_rms.shape != action_delta.shape:
+            accepted = torch.zeros_like(action_delta, dtype=torch.bool)
+            residual_rms = torch.full_like(action_delta, float("inf"))
+        else:
+            accepted = (
+                action_delta <= self.action_gate_max_mean_abs_delta
+            ) & (
+                residual_rms.to(action_delta.device)
+                <= self.residual_gate_max_relative_rms
+            )
+        self._last_gate_metrics = {
+            "accepted": accepted.detach().cpu().tolist(),
+            "action_delta_mean_abs": action_delta.detach().cpu().tolist(),
+            "relative_residual_rms": residual_rms.detach().cpu().tolist(),
+            "action_threshold": self.action_gate_max_mean_abs_delta,
+            "residual_threshold": self.residual_gate_max_relative_rms,
+        }
+        return torch.where(
+            accepted[:, None, None],
+            meta_actions,
+            base_actions.to(dtype=meta_actions.dtype),
+        )
 
     def _required(self, key: str) -> str:
         value = self.runtime_config.get(key)
@@ -690,7 +770,11 @@ class FactorialMetaSubspaceRuntime(nn.Module):
                 identity = (2.0 * torch.sigmoid(logits) - 1.0).square().mean()
                 gradient, = torch.autograd.grad(flow + self.mask_weight * identity, logits)
                 raw_delta_u = -self.inner_lr * gradient
-                delta_u = torch.zeros_like(raw_delta_u) if self.no_inner_update else raw_delta_u
+                delta_u = (
+                    torch.zeros_like(raw_delta_u)
+                    if self.no_inner_update
+                    else self.inner_update_scale * raw_delta_u
+                )
                 updated = logits + delta_u
             if not torch.isfinite(updated).all():
                 raise FloatingPointError("Non-finite meta-subspace inner update")
@@ -713,6 +797,7 @@ class FactorialMetaSubspaceRuntime(nn.Module):
                 inner_support_samples=[{"supports": list(records), "flow_seed": noise_seed, "flow_loss": float(flow.detach().cpu())}],
                 inner_update_computed=True,
                 inner_update_applied=not self.no_inner_update,
+                inner_update_scale=self.inner_update_scale,
                 delta_condition_retained=bool(self.spec.get("delta_condition", False)),
                 query_direct_mask=False if self.mask_guided else True,
             )
@@ -725,6 +810,33 @@ class FactorialMetaSubspaceRuntime(nn.Module):
                     importance_rms=float(importance.detach().square().mean().sqrt().cpu()),
                     delta_mask_rms=float(delta_mask.detach().square().mean().sqrt().cpu()),
                 )
+            if self.support_gate_min_relative_improvement >= 0:
+                with torch.inference_mode(False), torch.enable_grad():
+                    adapted_flow = self._support_flow_loss(
+                        list(raw_rows), code, updated.detach(), seed=noise_seed
+                    )
+                relative_improvement = float(
+                    ((flow.detach() - adapted_flow.detach())
+                    / flow.detach().abs().clamp_min(1e-12)).cpu()
+                )
+                passed = (
+                    relative_improvement
+                    >= self.support_gate_min_relative_improvement
+                )
+                details.update(
+                    support_adapted_flow_loss=float(adapted_flow.detach().cpu()),
+                    support_relative_improvement=relative_improvement,
+                    support_gate_min_relative_improvement=(
+                        self.support_gate_min_relative_improvement
+                    ),
+                    support_gate_passed=passed,
+                )
+                if not passed:
+                    details.update(
+                        identity_fallback=True,
+                        fallback_reason="support_loss_gate",
+                    )
+                    return None, details
         return state, details
 
     def _state_for(self, base_task_id: str, category: str):
