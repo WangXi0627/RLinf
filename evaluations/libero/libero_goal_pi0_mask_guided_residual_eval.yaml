@@ -89,3 +89,8 @@ rollout:
         verify_artifact_hashes: True
         verify_base_identity: True
         no_inner_update: ${oc.env:MASK_GUIDED_NO_INNER_UPDATE,false}
+        inner_update_scale: ${oc.env:MASK_GUIDED_INNER_UPDATE_SCALE,1.0}
+        support_gate_min_relative_improvement: ${oc.env:MASK_GUIDED_SUPPORT_GATE_MIN_RELATIVE_IMPROVEMENT,-1.0}
+        residual_gate_max_relative_rms: ${oc.env:MASK_GUIDED_RESIDUAL_GATE_MAX_RELATIVE_RMS,-1.0}
+        action_gate_max_mean_abs_delta: ${oc.env:MASK_GUIDED_ACTION_GATE_MAX_MEAN_ABS_DELTA,-1.0}
+        action_gate_horizon: ${oc.env:MASK_GUIDED_ACTION_GATE_HORIZON,5}
