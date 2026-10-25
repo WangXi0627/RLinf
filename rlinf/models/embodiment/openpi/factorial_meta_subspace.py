@@ -863,6 +863,12 @@ class FactorialMetaSubspaceRuntime(nn.Module):
         if not (len(suites) == len(names) == len(categories) == len(ids)):
             raise ValueError("Factorial environment metadata batch mismatch")
 
+        # Zero strength is an intentional vanilla-policy baseline.  Bypass
+        # Support adaptation and the intervention hook entirely so strict mode
+        # does not reinterpret the identity control as missing Support.
+        if self.intervention_strength == 0:
+            return None
+
         states = []
         for suite, task_id, name, category in zip(suites, ids, names, categories, strict=True):
             try:
