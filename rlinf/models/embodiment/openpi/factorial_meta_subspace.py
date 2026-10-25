@@ -928,6 +928,19 @@ class FactorialMetaSubspaceRuntime(nn.Module):
             "support_size": self.support_size, "support_seed": self.support_seed,
             "intervention_strength": self.intervention_strength,
             "mask_guided": self.mask_guided, "no_inner_update": self.no_inner_update,
-            "action_mode": self.action_mode, "cached_task_states": len(self._states),
+            "inner_update_scale": self.inner_update_scale,
+            "action_mode": self.action_mode,
+            "support_gate_min_relative_improvement": (
+                self.support_gate_min_relative_improvement
+            ),
+            "residual_gate_max_relative_rms": (
+                self.residual_gate_max_relative_rms
+            ),
+            "action_gate_max_mean_abs_delta": (
+                self.action_gate_max_mean_abs_delta
+            ),
+            "action_gate_horizon": self.action_gate_horizon,
+            "last_action_gate": dict(self._last_gate_metrics),
+            "cached_task_states": len(self._states),
             "task_states": list(self._state_details.values()),
         }
