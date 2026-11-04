@@ -110,6 +110,8 @@ category_name() {
     objects_layout) echo "Objects Layout" ;;
     camera_viewpoints) echo "Camera Viewpoints" ;;
     sensor_noise) echo "Sensor Noise" ;;
+    robot_initial_states) echo "Robot Initial States" ;;
+    language_instructions) echo "Language Instructions" ;;
     *) echo "unknown category key: $1" >&2; return 2 ;;
   esac
 }

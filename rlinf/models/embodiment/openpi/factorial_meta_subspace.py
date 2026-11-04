@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import math
 import weakref
 from contextlib import contextmanager
@@ -423,7 +424,11 @@ class FactorialMetaSubspaceRuntime(nn.Module):
         if self.manifest.get("schema_version") != 1 or self.manifest.get("kind") != "libero-plus-meta-subspace-pool":
             raise ValueError("Unsupported factorial manifest")
         self.rows = self.manifest["episodes"]
-        self.episodes_root = Path(self.manifest["episodes_root"]).expanduser().resolve()
+        episodes_root_value = os.environ.get(
+            "META_SUBSPACE_EPISODES_ROOT",
+            self.manifest["episodes_root"],
+        )
+        self.episodes_root = Path(episodes_root_value).expanduser().resolve()
 
         self.feature_dir = feature_dir
         self.feature_index_path = feature_dir / "index.json"
